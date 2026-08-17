@@ -1,0 +1,372 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+
+import cv2
+import numpy as np
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from backend.offline import EpisodeValidationError, OfflineEpisodeBackend
+
+
+def _stream(width: int, height: int, *, fx: float, fy: float, cx: float, cy: float):
+    return {
+        "width": width,
+        "height": height,
+        "intrinsics": {
+            "width": width,
+            "height": height,
+            "fx": fx,
+            "fy": fy,
+            "cx": cx,
+            "cy": cy,
+        },
+        "distortion": {
+            "model": "brown_conrady",
+            "coefficient_order": ["k1", "k2", "p1", "p2", "k3", "k4", "k5", "k6"],
+            "coefficients": [0.0] * 8,
+        },
+    }
+
+
+def _write_calibration(path: Path) -> None:
+    payload = {
+        "schema_version": 1,
+        "device": {"serial": "TEST"},
+        "color": _stream(4, 3, fx=100.0, fy=100.0, cx=1.0, cy=1.0),
+        "depth": _stream(4, 3, fx=100.0, fy=100.0, cx=1.0, cy=1.0),
+        "depth_to_color": {
+            "rotation_row_major": np.eye(3).tolist(),
+            "translation": [0.0, 0.0, 0.0],
+            "translation_unit": "mm",
+        },
+        "depth_scale": {"value": 1.0, "unit": "mm_per_raw_unit"},
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _write_episode(task_dir: Path, name: str, depths: list[int], *, dtype=np.uint16) -> Path:
+    root = task_dir / name
+    (root / "rgb").mkdir(parents=True)
+    (root / "depth").mkdir()
+    rows = []
+    for index, depth_mm in enumerate(depths):
+        image = np.full((3, 4, 3), 20 + index, dtype=np.uint8)
+        cv2.imwrite(str(root / "rgb" / f"{index:06d}_head_rgb.jpg"), image)
+        np.save(
+            root / "depth" / f"{index:06d}_head_depth.npy",
+            np.full((3, 4), depth_mm, dtype=dtype),
+            allow_pickle=False,
+        )
+        rows.append(
+            {
+                "idx": index,
+                "colors": {"head_rgb": f"rgb/{index:06d}_head_rgb.jpg"},
+                "depths": {"head_depth": f"depth/{index:06d}_head_depth.npy"},
+                "states": {"right_arm": {"qpos": [index * 0.01] * 7}},
+                "timestamps": {"sample_timestamp_ns": 1000 + index},
+                "rgbd": {
+                    "color_shape": [3, 4],
+                    "depth_shape": [3, 4],
+                    "color_format": "jpeg",
+                    "depth_format": "depth_z16",
+                    "depth_dtype": "uint16",
+                },
+            }
+        )
+    payload = {
+        "info": {
+            "version": "1.0.0",
+            "kind": "hand_eye_calibration",
+            "frame_count": len(rows),
+            "robot": "H2",
+            "camera_serial": "TEST",
+            "right_arm_joint_order": [
+                "right_shoulder_pitch",
+                "right_shoulder_roll",
+                "right_shoulder_yaw",
+                "right_elbow",
+                "right_wrist_roll",
+                "right_wrist_pitch",
+                "right_wrist_yaw",
+            ],
+        },
+        "data": rows,
+    }
+    (root / "data.json").write_text(json.dumps(payload), encoding="utf-8")
+    return root
+
+
+class OfflineEpisodeBackendTest(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.root = Path(self.tempdir.name)
+        self.calibration_path = self.root / "rgbd.json"
+        _write_calibration(self.calibration_path)
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+
+    def test_parse_preview_align_backproject_median_q_and_fk(self):
+        _write_episode(
+            self.root, "episode_0001", [980, 1000, 1020, 1010, 990]
+        )
+        backend = OfflineEpisodeBackend(self.root, self.calibration_path)
+
+        episodes = backend.scan()
+        self.assertEqual([item["name"] for item in episodes], ["episode_0001"])
+        self.assertTrue(episodes[0]["valid"])
+        self.assertEqual(episodes[0]["representative_frame"], 2)
+        self.assertGreater(len(backend.preview_jpeg("episode_0001")), 0)
+
+        result = backend.pick("episode_0001", 2, 1)
+        np.testing.assert_allclose(result["p_camera"], [0.01, 0.0, 1.0], atol=1e-8)
+        np.testing.assert_allclose(result["right_arm_q_median"], [0.02] * 7)
+        self.assertEqual(result["valid_depth_frames"], 5)
+        self.assertEqual(result["depth_spread_mm"], 40.0)
+        self.assertEqual(result["base_link"], "torso_link")
+        self.assertEqual(result["wrist_link"], "right_wrist_yaw_link")
+        T = np.asarray(result["T_base_wrist"])
+        self.assertEqual(T.shape, (4, 4))
+        np.testing.assert_allclose(T[3], [0.0, 0.0, 0.0, 1.0], atol=1e-12)
+        np.testing.assert_allclose(T[:3, :3] @ T[:3, :3].T, np.eye(3), atol=1e-10)
+
+    def test_rejects_unstable_depth(self):
+        _write_episode(
+            self.root, "episode_0002", [900, 950, 1000, 1050, 1100]
+        )
+        backend = OfflineEpisodeBackend(self.root, self.calibration_path)
+        with self.assertRaisesRegex(EpisodeValidationError, "跳动 200mm"):
+            backend.pick("episode_0002", 2, 1)
+
+    def test_confirm_many_aligns_each_depth_once_and_keeps_valid_markers(self):
+        _write_episode(
+            self.root, "episode_0004", [980, 1000, 1020, 1010, 990]
+        )
+        backend = OfflineEpisodeBackend(self.root, self.calibration_path)
+        real_aligner = backend.aligner
+
+        class CountingAligner:
+            def __init__(self):
+                self.calls = 0
+
+            def align(self, depth):
+                self.calls += 1
+                return real_aligner.align(depth)
+
+        counting = CountingAligner()
+        backend.aligner = counting
+        result = backend.confirm_markers(
+            "episode_0004",
+            [
+                {
+                    "id": "marker-red",
+                    "color": "red",
+                    "center": [2, 1],
+                    "radius_px": 12,
+                    "source": "edited",
+                },
+                {
+                    "id": "marker-blue",
+                    "color": "blue",
+                    "center": [99, 99],
+                    "radius_px": 12,
+                    "source": "edited",
+                },
+            ],
+        )
+        self.assertEqual(counting.calls, 5)
+        self.assertEqual(result["confirmed_count"], 1)
+        self.assertEqual(result["error_count"], 1)
+        observation = result["observations"][0]
+        self.assertEqual(observation["schema_version"], 2)
+        self.assertEqual(observation["marker_id"], "marker-red")
+        self.assertEqual(observation["color"], "red")
+        self.assertEqual(observation["pose_id"], "episode_0004")
+        np.testing.assert_allclose(observation["p_camera"], [0.01, 0.0, 1.0])
+        self.assertIn("像素越界", result["errors"][0]["error"])
+
+        with self.assertRaisesRegex(EpisodeValidationError, "canonical color"):
+            backend.confirm_markers(
+                "episode_0004",
+                [
+                    {
+                        "id": "red-a",
+                        "color": "red",
+                        "center": [1, 1],
+                        "radius_px": 10,
+                        "source": "edited",
+                    },
+                    {
+                        "id": "red-b",
+                        "color": "red",
+                        "center": [2, 1],
+                        "radius_px": 10,
+                        "source": "edited",
+                    },
+                ],
+            )
+        self.assertEqual(counting.calls, 5)
+
+    def test_scan_reports_non_uint16_depth(self):
+        _write_episode(
+            self.root, "episode_0003", [1000, 1000, 1000], dtype=np.float32
+        )
+        backend = OfflineEpisodeBackend(self.root, self.calibration_path)
+        episodes = backend.scan()
+        self.assertFalse(episodes[0]["valid"])
+        self.assertIn("原始 uint16", episodes[0]["error"])
+
+
+class SampleProvenanceTest(unittest.TestCase):
+    def test_preserves_provenance_and_rejects_duplicate_episode(self):
+        from backend import app as app_module
+
+        old_save_path = app_module.save_path
+        old_offline_backend = app_module.offline_backend
+        with tempfile.TemporaryDirectory() as tempdir:
+            try:
+                app_module.save_path = Path(tempdir)
+                app_module.offline_backend = SimpleNamespace(
+                    base_link="torso_link",
+                    wrist_link="right_wrist_yaw_link",
+                    calibration=SimpleNamespace(
+                        color_shape=(1080, 1920),
+                        serial="TEST",
+                    ),
+                )
+                app_module.init_state()
+                status = asyncio.run(app_module.api_status())
+                self.assertEqual(status["mode"], "offline")
+                self.assertEqual(status["base_link"], "torso_link")
+                self.assertEqual(status["wrist_link"], "right_wrist_yaw_link")
+                self.assertEqual(status["camera"]["serial"], "TEST")
+                body = {
+                    "p_camera": [0.0, 0.0, 1.0],
+                    "T_base_wrist": np.eye(4).tolist(),
+                    "pixel": [10, 20],
+                    "episode": "episode_0042",
+                    "provenance": {"mode": "offline_teleop_episode"},
+                }
+                first = asyncio.run(app_module.api_add_sample(body))
+                self.assertTrue(first["ok"])
+                saved = json.loads(
+                    (Path(tempdir) / "samples" / "0000.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(saved["episode"], "episode_0042")
+                self.assertEqual(saved["provenance"], body["provenance"])
+                self.assertEqual(saved["pose_source"], "offline_teleop_episode")
+                self.assertEqual(saved["camera"]["source"], "offline_teleop_episode")
+
+                duplicate = asyncio.run(app_module.api_add_sample(body))
+                self.assertEqual(duplicate.status_code, 409)
+                payload = json.loads(duplicate.body)
+                self.assertEqual(payload["duplicate_episode"], "episode_0042")
+                self.assertEqual(payload["existing_index"], 0)
+            finally:
+                app_module.save_path = old_save_path
+                app_module.offline_backend = old_offline_backend
+
+
+class BatchSampleApiTest(unittest.TestCase):
+    @staticmethod
+    def _observation(marker_id: str, color: str, episode: str) -> dict:
+        return {
+            "schema_version": 2,
+            "id": marker_id,
+            "marker_id": marker_id,
+            "color": color,
+            "episode": episode,
+            "pose_id": episode,
+            "center": [20.0, 30.0],
+            "radius_px": 14.0,
+            "source": "edited",
+            "p_camera": [0.0, 0.0, 1.0],
+            "T_base_wrist": np.eye(4).tolist(),
+            "provenance": {"mode": "offline_teleop_episode", "episode": episode},
+        }
+
+    def test_batch_allows_colors_and_rejects_duplicate_key_atomically(self):
+        from backend import app as app_module
+
+        old_save_path = app_module.save_path
+        old_offline_backend = app_module.offline_backend
+        with tempfile.TemporaryDirectory() as tempdir:
+            try:
+                app_module.save_path = Path(tempdir)
+                app_module.offline_backend = None
+                app_module.init_state()
+                episode = "episode_0100"
+                body = {
+                    "episode": episode,
+                    "observations": [
+                        self._observation("marker-red", "red", episode),
+                        self._observation("marker-blue", "blue", episode),
+                    ],
+                }
+                saved = asyncio.run(app_module.api_add_samples_batch(body))
+                self.assertTrue(saved["ok"])
+                self.assertEqual(saved["indices"], [0, 1])
+                records = app_module._load_samples()
+                self.assertEqual([record["schema_version"] for record in records], [2, 2])
+                self.assertEqual(
+                    {(record["episode"], record["marker_id"]) for record in records},
+                    {(episode, "marker-red"), (episode, "marker-blue")},
+                )
+                app_module.offline_backend = SimpleNamespace(
+                    scan=lambda: [{"name": episode, "valid": True}]
+                )
+                listing = asyncio.run(app_module.api_offline_episodes())
+                self.assertEqual(
+                    listing["episodes"][0]["imported_marker_ids"],
+                    ["marker-blue", "marker-red"],
+                )
+                self.assertEqual(
+                    listing["episodes"][0]["imported_marker_count"], 2
+                )
+                app_module.offline_backend = None
+
+                duplicate = asyncio.run(
+                    app_module.api_add_samples_batch(
+                        {
+                            "episode": episode,
+                            "observations": [
+                                self._observation("marker-red", "red", episode)
+                            ],
+                        }
+                    )
+                )
+                self.assertEqual(duplicate.status_code, 409)
+                self.assertEqual(len(app_module._load_samples()), 2)
+
+                invalid_episode = "episode_0101"
+                invalid = asyncio.run(
+                    app_module.api_add_samples_batch(
+                        {
+                            "episode": invalid_episode,
+                            "observations": [
+                                self._observation("red-a", "red", invalid_episode),
+                                self._observation("red-b", "red", invalid_episode),
+                            ],
+                        }
+                    )
+                )
+                self.assertEqual(invalid.status_code, 400)
+                self.assertEqual(len(app_module._load_samples()), 2)
+            finally:
+                app_module.save_path = old_save_path
+                app_module.offline_backend = old_offline_backend
+
+
+if __name__ == "__main__":
+    unittest.main()

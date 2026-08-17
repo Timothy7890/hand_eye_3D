@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+numpy
+opencv-python
+pyorbbecsdk2
+pyzmq
+PyYAML
