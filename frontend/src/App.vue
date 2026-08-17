@@ -856,6 +856,13 @@ onMounted(async () => {
               · 样本 {{ episodeSampleCount(episode) }}
               <template v-if="episode.camera_serial"> · 相机 {{ episode.camera_serial }}</template>
             </span>
+            <span
+              v-for="warning in (episode.warnings || [])"
+              :key="warning"
+              class="episode-warning"
+            >
+              ⚠ {{ warning }}
+            </span>
           </button>
         </div>
         <div v-else-if="!episodesBusy" class="coord dim">没有可用的离线剧集</div>
@@ -1415,6 +1422,12 @@ onMounted(async () => {
 .episode-meta {
   color: var(--text-dim);
   font-size: 11px;
+}
+
+.episode-warning {
+  color: var(--warn);
+  font-size: 11px;
+  line-height: 1.4;
 }
 
 .image-loading {

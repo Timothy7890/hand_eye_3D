@@ -1,5 +1,6 @@
 # Runtime data
 /teleop_data/
+/config/camera/orbbec_rgbd_calibration.json
 
 # Python caches and local environments
 __pycache__/
@@ -13,6 +14,7 @@ venv/
 # Frontend dependencies and build output
 node_modules/
 dist/
+dist-pointcloud/
 
 # Local-only files
 .env

@@ -12,10 +12,11 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-import sys
 
 import cv2
 import numpy as np
+
+from .rgbd import ZmqRGBDCamera
 
 DEPTH_HISTORY = 8  # 保留最近 N 帧对齐深度做时域中值滤波
 
@@ -366,12 +367,6 @@ def make_camera(
     if source == "zmq":
         if calibration_path is None:
             raise ValueError("ZMQ 相机必须提供 calibration_path")
-        ik_replay_root = Path("/home/robot/yx/project/IK_replay")
-        root = str(ik_replay_root)
-        if root not in sys.path:
-            sys.path.insert(0, root)
-        from camera_sources.zmq_rgbd import ZmqRGBDCamera
-
         return ZmqRGBDCamera(
             host=host,
             calibration_path=calibration_path,

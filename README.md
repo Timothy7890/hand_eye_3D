@@ -1,7 +1,7 @@
 # Hand-Eye 3D — 眼在手外标定（联合估计指尖偏移，免棋盘格）
 
 利用深度相机能直接给三维坐标的特点做手眼标定：同一个物理标记点
-（灵巧手指尖 / 手背贴纸），相机侧点击画面得 \(P_{camera}\)，机器人侧
+（灵巧手指尖 / 手背贴纸），相机侧从彩色点云中选择 \(P_{camera}\)，机器人侧
 只需提供**手腕位姿** \(T_{base}^{wrist}\)（DDS 自动读取）。求解器把
 相机外参和指尖偏移一起解出来，**不需要事先测量指尖装在哪**：
 
@@ -22,18 +22,24 @@
   与 video_tools 的彩色点云同系，
   解出的 T 可直接用于点云。
 - \(T_{base}^{wrist}\)：H2 模式下 base = `torso_link`、wrist = `right_wrist_yaw_link`
-  （取自 IK_replay 的 h2.yaml），FK 只用手臂 7 关节。
+  （取自项目内 `config/robots/h2.yaml`），FK 只用手臂 7 关节。
 
 ## 目录
 
 ```
 backend/
+  rgbd/       RGB-D 标定解析、软件深度对齐、teleimager ZMQ 只读客户端
+  robotics/   H2 YAML/URDF 解析与 FK
   solver.py    Kabsch + 联合解(交替 LS) + 留一验证 + 退化检测
   camera.py    teleimager ZMQ RGB-D（生产）+ Orbbec SDK（显式调试）+ mock
+  offline.py   离线 episode、深度对齐、稳定彩色点云与 H2 FK
   robot.py     手腕位姿 Provider：manual / http / h2(DDS+FK) / mock
-  app.py       FastAPI：预览、点击反投影、样本管理、解算
+  app.py       FastAPI：点云、选点确认、样本管理、解算
 run_server.py  入口（后端 8132）
-frontend/      Vue3 + Vite 界面（端口 7012）
+frontend/      Vue3 + Vite：图像版 7012、点云版 7013
+config/        项目内 H2 配置；camera/ 下放设备专属 RGB-D 标定
+assets/        H2 URDF（FK 不需要 STL mesh）
+tools/         Orbbec 标定导出和重力自检工具
 ```
 
 ## 环境
@@ -48,10 +54,32 @@ H2 模式额外需要 `unitree_sdk2py` + `cyclonedds`（目前这台机器只有
 unifolm-wma 环境跑本服务 / 在 unifolm-wma 里跑一个 pose sidecar 走
 `--pose-source http`。
 
+项目运行不依赖相邻仓库。RGB-D 对齐、ZMQ 解码、H2 配置、URDF 和 FK
+全部位于本仓库。
+
+### 生成设备专属 RGB-D 标定
+
+实际标定文件默认放在 `config/camera/orbbec_rgbd_calibration.json`，该文件
+绑定相机、分辨率和流格式，已被 `.gitignore` 排除。更换设备或生产 profile 后，
+使用本项目工具重新生成：
+
+```bash
+# macOS 上若 UVCAssistant 占用设备，使用 sudo -E；先停止其他相机进程
+sudo -E /opt/anaconda3/envs/fastapi/bin/python \
+  tools/export_orbbec_rgbd_calibration.py \
+  --serial CP0T263000F8 \
+  --color-width 1920 --color-height 1080 --color-fps 8 \
+  --depth-width 1280 --depth-height 800 --depth-fps 6 \
+  --output config/camera/orbbec_rgbd_calibration.json
+```
+
+Linux 可直接使用对应 Python 环境运行同一命令。工具只在导出时打开相机；
+生产服务只读取 JSON 并订阅 ZMQ。
+
 ## 启动
 
 ```bash
-# H2 真机（推荐）：teleimager ZMQ RGB-D + DDS 只读 rt/lowstate + IK_replay FK
+# H2 真机（推荐）：teleimager ZMQ RGB-D + DDS 只读 rt/lowstate + 项目内 H2 FK
 python run_server.py --camera-source zmq --camera-host 127.0.0.1 \
     --pose-source h2 --network-interface eth0
 
@@ -68,8 +96,9 @@ python run_server.py --camera-source orbbec --camera-serial CP0BB53000FS
 # 纯联调
 python run_server.py --camera-source mock --pose-source mock
 
-# 前端
-cd frontend && npm run dev     # http://<IP>:7012
+# 前端（分别启动）
+cd frontend && npm run dev                 # http://<IP>:7012 图像版
+cd frontend && npm run dev:pointcloud      # http://<IP>:7013 点云版
 ```
 
 > 默认 H2 模式**只订阅** `rt/lowstate`，绝不发布 `rt/arm_sdk`/`rt/lowcmd`，
@@ -81,13 +110,50 @@ cd frontend && npm run dev     # http://<IP>:7012
 本项目可以直接读取 eai-teleop-studio 的手眼标定任务目录：
 
 ```bash
+# 推荐：使用项目内默认目录
+./start_multicolor_calibration.sh
+
+# 等价的完整调用
 ./start.sh \
-  --teleop-task-dir /home/robot/yx/project/calib/hand_eye_3D/teleop_data/biaoding \
-  --rgbd-calib /home/robot/yx/project/IK_replay/config/camera/orbbec_rgbd_calibration.json
+  --teleop-task-dir ./teleop_data/biaoding \
+  --save-path ./handeye3d_data/biaoding \
+  --no-timestamp-dir
 ```
 
-离线模式不会打开 Orbbec、不会连接 DDS，也不会控制机器人。后端会复用
-IK_replay 的 H2 URDF/FK 和 `SoftwareDepthAligner`：
+专用脚本默认读取 `teleop_data/biaoding`，使用
+`config/camera/orbbec_rgbd_calibration.json`，并固定写入
+`handeye3d_data/biaoding`。也可通过环境变量覆盖：
+
+```bash
+TELEOP_TASK_DIR=/path/to/task \
+CALIB_SAVE_PATH=/path/to/output \
+RGBD_CALIB=/path/to/orbbec_rgbd_calibration.json \
+./start_multicolor_calibration.sh
+```
+
+离线模式不会打开 Orbbec、不会连接 DDS，也不会控制机器人。后端直接使用
+项目内 H2 URDF/FK 和 `SoftwareDepthAligner`：
+
+#### 7013 点云选点（推荐）
+
+`start.sh` 会同时启动图像版 `http://<IP>:7012` 和点云版
+`http://<IP>:7013`。7013 的操作流程：
+
+1. 左侧选择 `episode_*`。后端将五帧原始深度对齐到彩色相机，逐像素取中值，
+   只保留至少 3 帧有效、帧间 spread 不超过 80 mm、深度在 0.3–1.5 m 的稳定点，
+   并以代表 RGB 帧着色。
+2. 选择 marker 颜色，在三维点云中旋转、缩放后单击 marker 中心。页面显示的是
+   相机坐标系（X 右、Y 下、Z 前，米）；视觉层的 Y 翻转不会改变标定坐标。
+3. 页面只向后端提交 `cloud_id + vertex_index`。后端根据当前 episode 的确定性点云
+   重新取得 `p_camera`；如果源数据已变化或索引越界会拒绝，不接受浏览器任意提交
+   的三维坐标。
+4. 点击「确认并保存本姿态」，继续处理其他 episode，最后点击「运行手眼标定」。
+   保存格式仍为 schema v2，与 7012 共用样本目录和多 marker 求解器。
+
+点云默认按 2× 像素步长采样；小 marker 难以命中时切换为 1× 精细模式。每个
+episode 的每种 canonical color 仍然只能保存一个观测。
+
+#### 7012 图像检测与编辑（保留）
 
 1. 网页左侧选择一个 `episode_*`，显示该点位 5 帧中的代表 RGB。检测器先寻找
    手部附近的 8 mm 圆形，再按圆心区域的 HSV/Lab 颜色分类。
@@ -110,15 +176,16 @@ IK_replay 的 H2 URDF/FK 和 `SoftwareDepthAligner`：
 
 转换后的 `samples/*.json`、来源信息和最终 `handeye3d_result.json` 默认保存在
 本项目的 `handeye3d_data/<时间戳>/` 下。列表会显示每个 episode 已导入的颜色
-数量，同一 episode 的同一种颜色不能重复保存。RGB-D 相机序列号、分辨率、深度
-类型或右臂关节顺序与 JSON 标定不一致时，导入会直接拒绝，不会使用错误几何继续
-解算。旧的单点样本仍可单独解算，但不能与多标记样本混在同一次解算中。
+数量，同一 episode 的同一种颜色不能重复保存。RGB-D 相机序列号与 JSON 标定
+不一致时，API、7012 和 7013 都会显示黄色警告，但允许继续预览、选点和保存；
+分辨率、dtype、深度格式或右臂关节顺序不一致仍会严格拒绝，因为这些会改变几何
+含义。旧的单点样本仍可单独解算，但不能与多标记样本混在同一次解算中。
 
 ### --arm-control 手臂点动（可选）
 
 加 `--arm-control` 后，网页顶部多出「手臂控制」卡片。**启动时不接管**——
 点「获取控制」才开始发布 `rt/arm_sdk` 并在当前姿态刚性保持，点「归还控制」
-权重渐出交还本体控制器（与 IK_replay 的接管/释放语义一致）。摆位姿方式等价于老 hand_eye：
+权重渐出交还本体控制器。摆位姿方式等价于老 hand_eye：
 
 - **开启点动**：7 个关节各有 ±按钮，步长 0.5°/1°/2°/5°/10° 可选；
   目标以限速（`--arm-max-speed`，默认 0.2 rad/s）平滑逼近，且钳制在 URDF 限位内。

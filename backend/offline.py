@@ -1,9 +1,9 @@
-"""离线遥操作 episode 读取、RGB-D 对齐、点击反投影与 H2 FK。"""
+"""离线遥操作 episode 读取、RGB-D 对齐、彩色点云与 H2 FK。"""
 
 from __future__ import annotations
 
+import hashlib
 import json
-import sys
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,12 +13,9 @@ import cv2
 import numpy as np
 
 from .markers import CANONICAL_COLORS, canonical_color, detect_markers_bgr
-
-
-IK_REPLAY_ROOT = Path("/home/robot/yx/project/IK_replay")
-DEFAULT_RGBD_CALIB_PATH = (
-    IK_REPLAY_ROOT / "config" / "camera" / "orbbec_rgbd_calibration.json"
-)
+from .paths import DEFAULT_RGBD_CALIB_PATH, H2_ROBOT_CONFIG_PATH
+from .rgbd import RGBDCalibration, SoftwareDepthAligner
+from .robotics import RobotModel, load_robot_config
 RIGHT_ARM_DATASET_JOINTS = [
     "right_shoulder_pitch",
     "right_shoulder_roll",
@@ -31,22 +28,14 @@ RIGHT_ARM_DATASET_JOINTS = [
 DEPTH_VALID_MIN_MM = 60.0
 DEPTH_VALID_MAX_MM = 15000.0
 DEPTH_MAX_SPREAD_MM = 80.0
-
-
-def _load_ik_replay_types():
-    """从生产 IK_replay 工程加载共享的标定、对齐和机器人模型。"""
-    root = str(IK_REPLAY_ROOT)
-    if root not in sys.path:
-        sys.path.insert(0, root)
-    from camera_sources.alignment import RGBDCalibration, SoftwareDepthAligner
-    from core.robot_config import load_robot_config
-    from core.robot_model import RobotModel
-
-    return RGBDCalibration, SoftwareDepthAligner, load_robot_config, RobotModel
-
-
+POINT_CLOUD_PICK_MIN_MM = 300.0
+POINT_CLOUD_PICK_MAX_MM = 1500.0
 class EpisodeValidationError(ValueError):
     """遥操作 episode 内容不完整或与生产配置不兼容。"""
+
+
+class PointCloudStaleError(EpisodeValidationError):
+    """前端提交的点云已经不是当前 episode 对应的版本。"""
 
 
 @dataclass(frozen=True)
@@ -65,10 +54,56 @@ class OfflineEpisode:
     data_path: Path
     info: dict[str, Any]
     frames: tuple[OfflineFrame, ...]
+    warnings: tuple[str, ...] = ()
 
     @property
     def representative(self) -> OfflineFrame:
         return self.frames[len(self.frames) // 2]
+
+
+@dataclass(frozen=True)
+class OfflinePointCloud:
+    cloud_id: str
+    stride: int
+    points: np.ndarray
+    colors: np.ndarray
+    pixels: np.ndarray
+    valid_depth_frames: np.ndarray
+    depth_spread_mm: np.ndarray
+
+    def to_binary_ply(self) -> bytes:
+        records = np.empty(
+            len(self.points),
+            dtype=np.dtype(
+                [
+                    ("x", "<f4"),
+                    ("y", "<f4"),
+                    ("z", "<f4"),
+                    ("red", "u1"),
+                    ("green", "u1"),
+                    ("blue", "u1"),
+                ],
+                align=False,
+            ),
+        )
+        records["x"], records["y"], records["z"] = self.points.T
+        records["red"], records["green"], records["blue"] = self.colors.T
+        header = (
+            "ply\n"
+            "format binary_little_endian 1.0\n"
+            f"comment cloud_id {self.cloud_id}\n"
+            "comment coordinate_system camera_x_right_y_down_z_forward\n"
+            f"comment sampling_stride {self.stride}\n"
+            f"element vertex {len(records)}\n"
+            "property float x\n"
+            "property float y\n"
+            "property float z\n"
+            "property uchar red\n"
+            "property uchar green\n"
+            "property uchar blue\n"
+            "end_header\n"
+        ).encode("ascii")
+        return header + records.tobytes()
 
 
 class OfflineEpisodeBackend:
@@ -80,12 +115,9 @@ class OfflineEpisodeBackend:
         if not self.task_dir.is_dir():
             raise ValueError(f"遥操作任务目录不存在或不是目录: {self.task_dir}")
 
-        RGBDCalibration, SoftwareDepthAligner, load_robot_config, RobotModel = (
-            _load_ik_replay_types()
-        )
         self.calibration = RGBDCalibration.from_file(self.rgbd_calib_path)
         self.aligner = SoftwareDepthAligner(self.calibration)
-        config = load_robot_config(IK_REPLAY_ROOT / "config" / "robots" / "h2.yaml")
+        config = load_robot_config(H2_ROBOT_CONFIG_PATH)
         self.robot_model = RobotModel(config)
         self.chain = "right_arm"
         self.base_link = self.robot_model.base_link(self.chain)
@@ -96,6 +128,7 @@ class OfflineEpisodeBackend:
                 f"H2 right_arm 配置应有 7 个关节，实际为 {len(self.joint_names)}"
             )
         self._aligned_depth_cache: dict[tuple[Any, ...], np.ndarray] = {}
+        self._point_cloud_cache: dict[tuple[Any, ...], OfflinePointCloud] = {}
 
     def _candidate_paths(self) -> list[Path]:
         return sorted(self.task_dir.glob("episode_*/data.json"))
@@ -185,9 +218,10 @@ class OfflineEpisodeBackend:
             raise EpisodeValidationError(
                 f"{name} 的右臂关节顺序不符合 H2 生产约定"
             )
+        episode_warnings: list[str] = []
         serial = info.get("camera_serial")
         if serial and self.calibration.serial and str(serial) != self.calibration.serial:
-            raise EpisodeValidationError(
+            episode_warnings.append(
                 f"{name} 相机序列号 {serial} 与 RGB-D 标定 {self.calibration.serial} 不一致"
             )
 
@@ -276,6 +310,7 @@ class OfflineEpisodeBackend:
             data_path=data_path.resolve(),
             info=dict(info),
             frames=tuple(frames),
+            warnings=tuple(episode_warnings),
         )
 
     def _summary(self, episode: OfflineEpisode) -> dict[str, Any]:
@@ -286,8 +321,10 @@ class OfflineEpisodeBackend:
             "representative_frame": episode.representative.index,
             "preview_frame_idx": episode.representative.index,
             "camera_serial": episode.info.get("camera_serial"),
+            "calibration_serial": self.calibration.serial,
             "color_shape": list(self.calibration.color_shape),
             "preview_url": f"/api/offline/episodes/{episode.name}/preview",
+            "warnings": list(episode.warnings),
         }
 
     def preview_jpeg(self, name: str) -> bytes:
@@ -324,7 +361,7 @@ class OfflineEpisodeBackend:
             )
         candidates = detect_markers_bgr(image)
         detected_colors = {candidate["color"] for candidate in candidates}
-        warnings = [
+        detection_warnings = [
             f"{candidate['color']} 颜色容易受光照/材质影响，请人工确认"
             for candidate in candidates
             if "ambiguity_prone_color" in candidate["flags"]
@@ -339,7 +376,7 @@ class OfflineEpisodeBackend:
             "missing_colors": [
                 color for color in CANONICAL_COLORS if color not in detected_colors
             ],
-            "warnings": warnings,
+            "warnings": [*episode.warnings, *detection_warnings],
         }
 
     def _wrist_pose(self, q: np.ndarray) -> np.ndarray:
@@ -378,6 +415,99 @@ class OfflineEpisodeBackend:
         stack = np.stack(aligned, axis=0)
         self._aligned_depth_cache = {key: stack}
         return stack
+
+    def _point_cloud_cache_key(
+        self, episode: OfflineEpisode, stride: int
+    ) -> tuple[Any, ...]:
+        representative = episode.representative.color_path
+        calibration_stat = self.rgbd_calib_path.stat()
+        return (
+            self._depth_cache_key(episode),
+            str(representative),
+            representative.stat().st_mtime_ns,
+            representative.stat().st_size,
+            str(self.rgbd_calib_path),
+            calibration_stat.st_mtime_ns,
+            calibration_stat.st_size,
+            stride,
+        )
+
+    def point_cloud(self, name: str, stride: int = 2) -> OfflinePointCloud:
+        """生成稳定的彩色相机系点云，顶点顺序按采样后的像素行优先排列。"""
+        if isinstance(stride, bool) or not isinstance(stride, int) or not 1 <= stride <= 8:
+            raise EpisodeValidationError("point cloud stride 必须是 1~8 的整数")
+        episode = self.load(name)
+        key = self._point_cloud_cache_key(episode, stride)
+        cached = self._point_cloud_cache.get(key)
+        if cached is not None:
+            return cached
+
+        stack = self._aligned_depth_stack(episode)
+        valid = (
+            np.isfinite(stack)
+            & (stack > DEPTH_VALID_MIN_MM)
+            & (stack < DEPTH_VALID_MAX_MM)
+        )
+        valid_count = np.sum(valid, axis=0)
+        required = max(3, len(stack) // 2)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            median_mm = np.nanmedian(np.where(valid, stack, np.nan), axis=0)
+        minimum_mm = np.min(np.where(valid, stack, np.inf), axis=0)
+        maximum_mm = np.max(np.where(valid, stack, -np.inf), axis=0)
+        spread_mm = maximum_mm - minimum_mm
+        stable = (
+            (valid_count >= required)
+            & np.isfinite(median_mm)
+            & np.isfinite(spread_mm)
+            & (spread_mm <= DEPTH_MAX_SPREAD_MM)
+            & (median_mm >= POINT_CLOUD_PICK_MIN_MM)
+            & (median_mm <= POINT_CLOUD_PICK_MAX_MM)
+        )
+
+        color_h, color_w = self.calibration.color_shape
+        sampled_v = np.arange(0, color_h, stride, dtype=np.int32)
+        sampled_u = np.arange(0, color_w, stride, dtype=np.int32)
+        grid_u, grid_v = np.meshgrid(sampled_u, sampled_v)
+        sampled_stable = stable[grid_v, grid_u]
+        pixels = np.column_stack(
+            (grid_u[sampled_stable], grid_v[sampled_stable])
+        ).astype(np.int32, copy=False)
+        if not len(pixels):
+            raise EpisodeValidationError("该 episode 没有可用于点云的稳定深度像素")
+
+        u = pixels[:, 0]
+        v = pixels[:, 1]
+        z = median_mm[v, u].astype(np.float32) / 1000.0
+        fx, fy, cx, cy = self.calibration.color_intrinsics
+        points = np.column_stack(
+            ((u - cx) * z / fx, (v - cy) * z / fy, z)
+        ).astype(np.float32, copy=False)
+
+        image = cv2.imread(str(episode.representative.color_path), cv2.IMREAD_COLOR)
+        if image is None or image.shape[:2] != self.calibration.color_shape:
+            raise EpisodeValidationError(
+                f"代表 RGB 图片无法用于点云着色: {episode.representative.color_path}"
+            )
+        colors = image[v, u, ::-1].astype(np.uint8, copy=True)
+        cloud_id = hashlib.sha256(repr(key).encode("utf-8")).hexdigest()[:24]
+        cloud = OfflinePointCloud(
+            cloud_id=cloud_id,
+            stride=stride,
+            points=points,
+            colors=colors,
+            pixels=pixels,
+            valid_depth_frames=valid_count[v, u].astype(np.uint8, copy=False),
+            depth_spread_mm=spread_mm[v, u].astype(np.float32, copy=False),
+        )
+        self._point_cloud_cache = {key: cloud}
+        return cloud
+
+    def point_cloud_ply(
+        self, name: str, stride: int = 2
+    ) -> tuple[bytes, OfflinePointCloud]:
+        cloud = self.point_cloud(name, stride)
+        return cloud.to_binary_ply(), cloud
 
     def depth_overlay_png(self, name: str) -> bytes:
         """把五帧 RGB 对齐深度的逐像素中值渲染成透明伪彩 PNG。"""
@@ -584,6 +714,145 @@ class OfflineEpisodeBackend:
             "T_base_wrist": T_base_wrist.tolist(),
             "right_arm_q_median": q_median.tolist(),
             "burst_frames_used": len(episode.frames),
+            "warnings": list(episode.warnings),
+        }
+
+    def confirm_points(
+        self,
+        name: str,
+        cloud_id: str,
+        stride: int,
+        selections: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """按可信点云顶点索引生成多 marker observation。"""
+        if not isinstance(cloud_id, str) or not cloud_id.strip():
+            raise EpisodeValidationError("cloud_id 必须是非空字符串")
+        if not isinstance(selections, list) or not selections:
+            raise EpisodeValidationError("selections 必须是非空数组")
+        episode = self.load(name)
+        cloud = self.point_cloud(name, stride)
+        if cloud.cloud_id != cloud_id.strip():
+            raise PointCloudStaleError("点云已经变化，请重新加载后再选点")
+
+        normalized: list[dict[str, Any]] = []
+        for position, selection in enumerate(selections):
+            if not isinstance(selection, dict):
+                raise EpisodeValidationError(
+                    f"第 {position} 个 selection 必须是 JSON object"
+                )
+            marker_id = selection.get("id", selection.get("marker_id"))
+            if not isinstance(marker_id, str) or not marker_id.strip():
+                raise EpisodeValidationError(
+                    f"第 {position} 个 selection 缺少非空 marker id"
+                )
+            try:
+                color = canonical_color(selection.get("color"))
+                vertex_index = int(selection["vertex_index"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise EpisodeValidationError(
+                    f"第 {position} 个 selection 的颜色或 vertex_index 不合法"
+                ) from exc
+            if vertex_index < 0 or vertex_index >= len(cloud.points):
+                raise EpisodeValidationError(
+                    f"第 {position} 个 selection 的 vertex_index {vertex_index} 越界，"
+                    f"点云共有 {len(cloud.points)} 个顶点"
+                )
+            normalized.append(
+                {
+                    "marker_id": marker_id.strip(),
+                    "color": color,
+                    "vertex_index": vertex_index,
+                }
+            )
+
+        marker_ids = [item["marker_id"] for item in normalized]
+        colors = [item["color"] for item in normalized]
+        if len(set(marker_ids)) != len(marker_ids):
+            raise EpisodeValidationError("同一 episode 中 marker id 必须唯一")
+        if len(set(colors)) != len(colors):
+            raise EpisodeValidationError(
+                "同一 episode 中每种 canonical color 只能确认一个点"
+            )
+
+        q_median = np.median(
+            np.stack([frame.right_q for frame in episode.frames]), axis=0
+        )
+        T_base_wrist = self._wrist_pose(q_median)
+        representative = episode.representative
+        observations = []
+        for selection in normalized:
+            index = selection["vertex_index"]
+            point = cloud.points[index].astype(float)
+            pixel = cloud.pixels[index].astype(int)
+            valid_frames = int(cloud.valid_depth_frames[index])
+            spread = float(cloud.depth_spread_mm[index])
+            depth_mm = float(point[2] * 1000.0)
+            marker_id = selection["marker_id"]
+            observation = {
+                "schema_version": 2,
+                "id": marker_id,
+                "marker_id": marker_id,
+                "color": selection["color"],
+                "episode": episode.name,
+                "pose_id": episode.name,
+                "source": "point_cloud",
+                "vertex_index": index,
+                "cloud_id": cloud.cloud_id,
+                "point_cloud_stride": cloud.stride,
+                "pixel": pixel.tolist(),
+                "center": pixel.astype(float).tolist(),
+                "p_camera": point.tolist(),
+                "T_base_wrist": T_base_wrist.tolist(),
+                "depth_mm": depth_mm,
+                "valid_ratio": float(valid_frames / len(episode.frames)),
+                "valid_depth_frames": valid_frames,
+                "depth_frame_count": len(episode.frames),
+                "burst_frames_used": len(episode.frames),
+                "depth_spread_mm": spread,
+                "right_arm_q_median": q_median.tolist(),
+                "qpos_median_rad": q_median.tolist(),
+                "base_link": self.base_link,
+                "wrist_link": self.wrist_link,
+                "camera_serial": episode.info.get("camera_serial"),
+                "provenance": {
+                    "mode": "offline_point_cloud",
+                    "episode": episode.name,
+                    "task_dir": str(self.task_dir),
+                    "data_json": str(episode.data_path),
+                    "rgbd_calibration": str(self.rgbd_calib_path),
+                    "camera_serial": episode.info.get("camera_serial"),
+                    "frame_indices": [frame.index for frame in episode.frames],
+                    "representative_frame": representative.index,
+                    "representative_rgb": str(representative.color_path),
+                    "timestamps": representative.timestamps,
+                    "cloud_id": cloud.cloud_id,
+                    "point_cloud_stride": cloud.stride,
+                    "vertex_index": index,
+                    "pixel": pixel.tolist(),
+                    "burst_frames_used": len(episode.frames),
+                    "valid_depth_frames": valid_frames,
+                    "depth_mm": depth_mm,
+                    "depth_spread_mm": spread,
+                    "qpos_median_rad": q_median.tolist(),
+                },
+            }
+            observations.append(observation)
+
+        return {
+            "ok": True,
+            "episode": episode.name,
+            "pose_id": episode.name,
+            "cloud_id": cloud.cloud_id,
+            "point_cloud_stride": cloud.stride,
+            "observations": observations,
+            "markers": observations,
+            "confirmed_count": len(observations),
+            "error_count": 0,
+            "errors": [],
+            "T_base_wrist": T_base_wrist.tolist(),
+            "right_arm_q_median": q_median.tolist(),
+            "burst_frames_used": len(episode.frames),
+            "warnings": list(episode.warnings),
         }
 
     def confirm_markers(
@@ -643,6 +912,7 @@ class OfflineEpisodeBackend:
             "base_link": self.base_link,
             "wrist_link": self.wrist_link,
             "camera_serial": episode.info.get("camera_serial"),
+            "warnings": list(episode.warnings),
             "provenance": {
                 "mode": "offline_teleop_episode",
                 "episode": episode.name,

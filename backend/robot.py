@@ -6,7 +6,7 @@
 来源:
   - manual : 不自动读取，位姿由操作员在网页里手填 xyz+rpy（默认）
   - http   : GET JSON 端点 {"T": 4x4} 或 {"xyz": [...], "rpy": [...]}（弧度）
-  - h2     : DDS 订阅 rt/lowstate（只读，绝不发指令）+ IK_replay 的 URDF FK
+  - h2     : DDS 订阅 rt/lowstate（只读，绝不发指令）+ 项目内 H2 URDF FK
   - mock   : 随时间变化的假位姿，联调 UI 用
 
 H2 说明
@@ -21,17 +21,15 @@ from __future__ import annotations
 
 import json
 import math
-import sys
 import threading
 import time
 import urllib.request
-from pathlib import Path
 
 import numpy as np
 
+from .paths import H2_ROBOT_CONFIG_PATH
+from .robotics import RobotModel, load_robot_config
 from .solver import make_T, rpy_to_rot
-
-IK_REPLAY_ROOT = Path("/home/robot/yx/project/IK_replay")
 
 # rt/lowstate motor_state 里右臂 7 关节的下标（与 h2.yaml 的 right_arm joints 顺序一致，
 # 来源: eai_teleoperate_studio/tools/h2_official_arm_sdk_control.py 的 H2JointIndex）
@@ -120,11 +118,11 @@ class HttpPoseProvider(PoseProvider):
 
 
 class H2PoseProvider(PoseProvider):
-    """H2 真机：订阅 rt/lowstate（只读）→ IK_replay URDF FK → T_torso^wrist。
+    """H2 真机：订阅 rt/lowstate（只读）→ 项目内 URDF FK → T_torso^wrist。
 
     依赖:
       - unitree_sdk2py（DDS）
-      - /home/robot/yx/project/IK_replay（h2 URDF + RobotModel FK）
+      - 本项目 config/robots/h2.yaml 与 assets/robots/h2/robot.urdf
     """
 
     source = "h2"
@@ -139,12 +137,7 @@ class H2PoseProvider(PoseProvider):
 
         from .dds import ensure_dds_initialized
 
-        if str(IK_REPLAY_ROOT) not in sys.path:
-            sys.path.insert(0, str(IK_REPLAY_ROOT))
-        from core.robot_config import load_robot_config
-        from core.robot_model import RobotModel
-
-        cfg = load_robot_config(IK_REPLAY_ROOT / "config" / "robots" / "h2.yaml")
+        cfg = load_robot_config(H2_ROBOT_CONFIG_PATH)
         self._model = RobotModel(cfg)
         self._chain = f"{arm}_arm"
         if self._chain not in self._model.chain_ids:

@@ -10,10 +10,13 @@ set -u
 
 cd "$(dirname "$0")"
 
-PY=~/miniconda3/envs/fastapi/bin/python   # fastapi 环境包含 pyzmq + unitree_sdk2py
-IFACE=enp86s0
+PY="${PYTHON:-$HOME/miniconda3/envs/fastapi/bin/python}"
+if [ ! -x "$PY" ]; then
+  PY="$(command -v python3 || command -v python)"
+fi
+IFACE="${NETWORK_INTERFACE:-enp86s0}"
 CAMERA_HOST="${CAMERA_HOST:-127.0.0.1}"
-RGBD_CALIB="${RGBD_CALIB:-/home/robot/yx/project/IK_replay/config/camera/orbbec_rgbd_calibration.json}"
+RGBD_CALIB="${RGBD_CALIB:-$PWD/config/camera/orbbec_rgbd_calibration.json}"
 
 ARM_ARGS=(--arm-control)
 EXTRA=()
@@ -39,11 +42,13 @@ if [ ${#ARM_ARGS[@]} -gt 0 ]; then
 fi
 
 BACK_PID=""
-FRONT_PID=""
+FRONT_IMAGE_PID=""
+FRONT_CLOUD_PID=""
 cleanup() {
   echo ""
   echo "[start] 正在退出（手臂权重渐出，请扶住手臂）..."
-  [ -n "$FRONT_PID" ] && kill "$FRONT_PID" 2>/dev/null
+  [ -n "$FRONT_IMAGE_PID" ] && kill "$FRONT_IMAGE_PID" 2>/dev/null
+  [ -n "$FRONT_CLOUD_PID" ] && kill "$FRONT_CLOUD_PID" 2>/dev/null
   [ -n "$BACK_PID" ] && kill -INT "$BACK_PID" 2>/dev/null
   [ -n "$BACK_PID" ] && wait "$BACK_PID" 2>/dev/null
   exit 0
@@ -63,10 +68,17 @@ if ! kill -0 "$BACK_PID" 2>/dev/null; then
 fi
 
 (cd frontend && npm run dev --silent) &
-FRONT_PID=$!
+FRONT_IMAGE_PID=$!
+(cd frontend && npm run dev:pointcloud --silent) &
+FRONT_CLOUD_PID=$!
 
-IP=$(hostname -I | awk '{print $1}')
-echo "[start] 后端 http://${IP}:8132   前端 http://${IP}:7012   （Ctrl+C 一起退出）"
+if hostname -I >/dev/null 2>&1; then
+  IP="$(hostname -I | awk '{print $1}')"
+else
+  IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo 127.0.0.1)"
+fi
+echo "[start] 后端 http://${IP}:8132"
+echo "[start] 图像选点 http://${IP}:7012   点云选点 http://${IP}:7013   （Ctrl+C 一起退出）"
 
-wait "$FRONT_PID" "$BACK_PID"
+wait "$FRONT_IMAGE_PID" "$FRONT_CLOUD_PID" "$BACK_PID"
 cleanup

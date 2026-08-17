@@ -15,13 +15,11 @@ from pathlib import Path
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
-IK_REPLAY = Path("/home/robot/yx/project/IK_replay")
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(IK_REPLAY))
 
 from backend.gravity import G_ACCEL, ArmGravityModel  # noqa: E402
-from core.robot_config import load_robot_config  # noqa: E402
-from core.robot_model import RobotModel  # noqa: E402
+from backend.paths import H2_ROBOT_CONFIG_PATH  # noqa: E402
+from backend.robotics import RobotModel, load_robot_config  # noqa: E402
 
 
 def potential_energy(model, gm, q) -> float:
@@ -71,7 +69,7 @@ def main() -> int:
     ap.add_argument("--payload-kg", type=float, default=0.0)
     args = ap.parse_args()
 
-    model = RobotModel(load_robot_config(IK_REPLAY / "config" / "robots" / "h2.yaml"))
+    model = RobotModel(load_robot_config(H2_ROBOT_CONFIG_PATH))
     gm = ArmGravityModel(model, args.chain, payload_kg=args.payload_kg)
 
     print("== 模型 ==")

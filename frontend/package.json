@@ -5,10 +5,13 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:pointcloud": "vite --config vite.pointcloud.config.js",
     "build": "vite build",
+    "build:pointcloud": "vite build --config vite.pointcloud.config.js",
     "preview": "vite preview"
   },
   "dependencies": {
+    "three": "^0.185.1",
     "vue": "^3.4"
   },
   "devDependencies": {

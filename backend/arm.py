@@ -23,21 +23,20 @@ pinocchio RNEA）一致，已逐点对拍到 1e-15 Nm，见 tools/check_gravity.
 
 from __future__ import annotations
 
-import sys
 import threading
 import time
-from pathlib import Path
 
 import numpy as np
 
 from .dds import ensure_dds_initialized
 from .gravity import ArmGravityModel, gravity_dir_from_quaternion, parse_effort_limits
+from .paths import H2_ROBOT_CONFIG_PATH
 from .robot import (
     H2_LEFT_ARM_MOTOR_INDICES,
     H2_RIGHT_ARM_MOTOR_INDICES,
-    IK_REPLAY_ROOT,
     read_torso_state,
 )
+from .robotics import RobotModel, load_robot_config
 
 CONTROL_DT = 0.02          # 50Hz，官方示例节拍
 WEIGHT_RAMP_S = 1.0        # 权重渐入/渐出时长
@@ -58,13 +57,8 @@ EFFORT_MARGIN = 0.6        # 前馈总量不超过 URDF 额定力矩的这个比
 
 
 def _load_arm_model(arm: str):
-    """加载 IK_replay 的 h2 URDF 模型，返回 (model, chain_id)。"""
-    if str(IK_REPLAY_ROOT) not in sys.path:
-        sys.path.insert(0, str(IK_REPLAY_ROOT))
-    from core.robot_config import load_robot_config
-    from core.robot_model import RobotModel
-
-    model = RobotModel(load_robot_config(IK_REPLAY_ROOT / "config" / "robots" / "h2.yaml"))
+    """加载项目内 H2 URDF 模型，返回 (model, chain_id)。"""
+    model = RobotModel(load_robot_config(H2_ROBOT_CONFIG_PATH))
     return model, f"{arm}_arm"
 
 

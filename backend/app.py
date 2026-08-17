@@ -1,4 +1,4 @@
-"""FastAPI app：彩色流预览 + 点击取 P_camera + 手腕位姿配对 + 联合解算。
+"""FastAPI app：彩色流/离线点云 + P_camera + 手腕位姿配对 + 联合解算。
 
 每个样本 = P_camera（点击反投影）+ T_base^wrist（自动读取或手填 xyz+rpy）。
 解算联合估计 T_base^camera 和指尖偏移 p_tool（腕系），不需要事先量偏移。
@@ -25,6 +25,7 @@ from .offline import (
     DEFAULT_RGBD_CALIB_PATH,
     EpisodeValidationError,
     OfflineEpisodeBackend,
+    PointCloudStaleError,
 )
 from .markers import CANONICAL_COLORS, canonical_color, marker_catalog_public
 from .robot import ManualPoseProvider, PoseProvider
@@ -152,6 +153,7 @@ async def api_status():
             "enabled": offline_backend is not None,
             "teleop_task_dir": str(teleop_task_dir) if teleop_task_dir else None,
             "rgbd_calib": str(rgbd_calib_path),
+            "serial_mismatch_policy": "warning",
         },
     }
 
@@ -281,6 +283,40 @@ async def api_offline_depth_overlay(name: str):
     )
 
 
+@app.get("/api/offline/episodes/{name}/point-cloud.ply")
+async def api_offline_point_cloud(name: str, stride: int = 2):
+    if offline_backend is None:
+        return JSONResponse(
+            {"ok": False, "error": "未配置离线遥操作任务目录，请用 --teleop-task-dir 启动"},
+            status_code=409,
+        )
+    try:
+        ply, cloud = await asyncio.to_thread(
+            offline_backend.point_cloud_ply, name, stride
+        )
+    except EpisodeValidationError as exc:
+        status = 404 if "元数据不存在" in str(exc) else 422
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=status)
+    except (OSError, ValueError) as exc:
+        return JSONResponse(
+            {"ok": False, "error": f"点云生成失败: {exc}"}, status_code=422
+        )
+    return Response(
+        content=ply,
+        media_type="application/octet-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Content-Disposition": f'inline; filename="{name}.ply"',
+            "X-Point-Cloud-Id": cloud.cloud_id,
+            "X-Point-Count": str(len(cloud.points)),
+            "X-Point-Cloud-Stride": str(cloud.stride),
+            "Access-Control-Expose-Headers": (
+                "X-Point-Cloud-Id, X-Point-Count, X-Point-Cloud-Stride"
+            ),
+        },
+    )
+
+
 @app.post("/api/offline/pick")
 async def api_offline_pick(body: dict):
     if offline_backend is None:
@@ -304,6 +340,49 @@ async def api_offline_pick(body: dict):
     except (OSError, ValueError) as exc:
         return JSONResponse(
             {"ok": False, "error": f"离线 episode 处理失败: {exc}"}, status_code=422
+        )
+    return result
+
+
+@app.post("/api/offline/confirm-points")
+async def api_offline_confirm_points(body: dict):
+    if offline_backend is None:
+        return JSONResponse(
+            {"ok": False, "error": "未配置离线遥操作任务目录，请用 --teleop-task-dir 启动"},
+            status_code=409,
+        )
+    try:
+        name = body["episode"]
+        cloud_id = body["cloud_id"]
+        stride = body.get("stride", 2)
+        selections = body["selections"]
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("episode 必须是非空字符串")
+        if not isinstance(cloud_id, str) or not cloud_id.strip():
+            raise ValueError("cloud_id 必须是非空字符串")
+        if isinstance(stride, bool):
+            raise ValueError("stride 必须是整数")
+        stride = int(stride)
+        if not isinstance(selections, list):
+            raise ValueError("selections 必须是数组")
+    except (KeyError, TypeError, ValueError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    try:
+        result = await asyncio.to_thread(
+            offline_backend.confirm_points,
+            name.strip(),
+            cloud_id.strip(),
+            stride,
+            selections,
+        )
+    except PointCloudStaleError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
+    except EpisodeValidationError as exc:
+        status = 404 if "元数据不存在" in str(exc) else 422
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=status)
+    except (OSError, ValueError) as exc:
+        return JSONResponse(
+            {"ok": False, "error": f"点云选点确认失败: {exc}"}, status_code=422
         )
     return result
 

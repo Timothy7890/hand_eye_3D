@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -16,7 +17,43 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from backend.offline import EpisodeValidationError, OfflineEpisodeBackend
+from backend.offline import (
+    EpisodeValidationError,
+    OfflineEpisodeBackend,
+    PointCloudStaleError,
+)
+
+
+class _FakeRobotModel:
+    def __init__(self, _config):
+        pass
+
+    @staticmethod
+    def base_link(_chain):
+        return "torso_link"
+
+    @staticmethod
+    def end_link(_chain):
+        return "right_wrist_yaw_link"
+
+    @staticmethod
+    def joint_names(_chain):
+        return list(RIGHT_ARM_TEST_JOINTS)
+
+    @staticmethod
+    def forward_kinematics(_joint_values, only_links):
+        return {link: np.eye(4) for link in only_links}
+
+
+RIGHT_ARM_TEST_JOINTS = [
+    "right_shoulder_pitch",
+    "right_shoulder_roll",
+    "right_shoulder_yaw",
+    "right_elbow",
+    "right_wrist_roll",
+    "right_wrist_pitch",
+    "right_wrist_yaw",
+]
 
 
 def _stream(width: int, height: int, *, fx: float, fy: float, cx: float, cy: float):
@@ -55,7 +92,14 @@ def _write_calibration(path: Path) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
-def _write_episode(task_dir: Path, name: str, depths: list[int], *, dtype=np.uint16) -> Path:
+def _write_episode(
+    task_dir: Path,
+    name: str,
+    depths: list[int],
+    *,
+    dtype=np.uint16,
+    camera_serial: str = "TEST",
+) -> Path:
     root = task_dir / name
     (root / "rgb").mkdir(parents=True)
     (root / "depth").mkdir()
@@ -90,7 +134,7 @@ def _write_episode(task_dir: Path, name: str, depths: list[int], *, dtype=np.uin
             "kind": "hand_eye_calibration",
             "frame_count": len(rows),
             "robot": "H2",
-            "camera_serial": "TEST",
+            "camera_serial": camera_serial,
             "right_arm_joint_order": [
                 "right_shoulder_pitch",
                 "right_shoulder_roll",
@@ -109,6 +153,12 @@ def _write_episode(task_dir: Path, name: str, depths: list[int], *, dtype=np.uin
 
 class OfflineEpisodeBackendTest(unittest.TestCase):
     def setUp(self):
+        self.robot_model_patch = patch("backend.offline.RobotModel", _FakeRobotModel)
+        self.robot_config_patch = patch(
+            "backend.offline.load_robot_config", return_value={}
+        )
+        self.robot_model_patch.start()
+        self.robot_config_patch.start()
         self.tempdir = tempfile.TemporaryDirectory()
         self.root = Path(self.tempdir.name)
         self.calibration_path = self.root / "rgbd.json"
@@ -116,6 +166,8 @@ class OfflineEpisodeBackendTest(unittest.TestCase):
 
     def tearDown(self):
         self.tempdir.cleanup()
+        self.robot_config_patch.stop()
+        self.robot_model_patch.stop()
 
     def test_parse_preview_align_backproject_median_q_and_fk(self):
         _write_episode(
@@ -141,6 +193,25 @@ class OfflineEpisodeBackendTest(unittest.TestCase):
         np.testing.assert_allclose(T[3], [0.0, 0.0, 0.0, 1.0], atol=1e-12)
         np.testing.assert_allclose(T[:3, :3] @ T[:3, :3].T, np.eye(3), atol=1e-10)
 
+    def test_serial_mismatch_is_visible_warning_not_validation_error(self):
+        _write_episode(
+            self.root,
+            "episode_0006",
+            [980, 1000, 1020, 1010, 990],
+            camera_serial="OTHER-CAMERA",
+        )
+        backend = OfflineEpisodeBackend(self.root, self.calibration_path)
+
+        episodes = backend.scan()
+        self.assertTrue(episodes[0]["valid"])
+        self.assertEqual(episodes[0]["calibration_serial"], "TEST")
+        self.assertIn("OTHER-CAMERA", episodes[0]["warnings"][0])
+        self.assertIn("TEST", episodes[0]["warnings"][0])
+
+        pick = backend.pick("episode_0006", 2, 1)
+        self.assertTrue(pick["warnings"])
+        self.assertEqual(pick["p_camera"][2], 1.0)
+
     def test_rejects_unstable_depth(self):
         _write_episode(
             self.root, "episode_0002", [900, 950, 1000, 1050, 1100]
@@ -148,6 +219,8 @@ class OfflineEpisodeBackendTest(unittest.TestCase):
         backend = OfflineEpisodeBackend(self.root, self.calibration_path)
         with self.assertRaisesRegex(EpisodeValidationError, "跳动 200mm"):
             backend.pick("episode_0002", 2, 1)
+        with self.assertRaisesRegex(EpisodeValidationError, "没有可用于点云"):
+            backend.point_cloud("episode_0002")
 
     def test_confirm_many_aligns_each_depth_once_and_keeps_valid_markers(self):
         _write_episode(
@@ -217,6 +290,66 @@ class OfflineEpisodeBackendTest(unittest.TestCase):
                 ],
             )
         self.assertEqual(counting.calls, 5)
+
+    def test_point_cloud_is_deterministic_and_confirms_vertex_indices(self):
+        _write_episode(
+            self.root, "episode_0005", [980, 1000, 1020, 1010, 990]
+        )
+        backend = OfflineEpisodeBackend(self.root, self.calibration_path)
+
+        cloud = backend.point_cloud("episode_0005", stride=2)
+        self.assertEqual(cloud.stride, 2)
+        self.assertEqual(cloud.points.shape, (4, 3))
+        np.testing.assert_array_equal(
+            cloud.pixels,
+            [[0, 0], [2, 0], [0, 2], [2, 2]],
+        )
+        np.testing.assert_allclose(
+            cloud.points,
+            [
+                [-0.01, -0.01, 1.0],
+                [0.01, -0.01, 1.0],
+                [-0.01, 0.01, 1.0],
+                [0.01, 0.01, 1.0],
+            ],
+            atol=1e-7,
+        )
+        np.testing.assert_array_equal(cloud.valid_depth_frames, [5, 5, 5, 5])
+        np.testing.assert_allclose(cloud.depth_spread_mm, [40.0] * 4)
+
+        ply, same_cloud = backend.point_cloud_ply("episode_0005", stride=2)
+        self.assertEqual(same_cloud.cloud_id, cloud.cloud_id)
+        self.assertIn(b"format binary_little_endian 1.0", ply)
+        self.assertIn(b"element vertex 4", ply)
+
+        result = backend.confirm_points(
+            "episode_0005",
+            cloud.cloud_id,
+            2,
+            [{"id": "marker-red", "color": "red", "vertex_index": 1}],
+        )
+        self.assertEqual(result["confirmed_count"], 1)
+        observation = result["observations"][0]
+        self.assertEqual(observation["schema_version"], 2)
+        self.assertEqual(observation["source"], "point_cloud")
+        self.assertEqual(observation["pixel"], [2, 0])
+        self.assertEqual(observation["provenance"]["mode"], "offline_point_cloud")
+        np.testing.assert_allclose(observation["p_camera"], [0.01, -0.01, 1.0])
+
+        with self.assertRaises(PointCloudStaleError):
+            backend.confirm_points(
+                "episode_0005",
+                "stale-cloud-id",
+                2,
+                [{"id": "marker-red", "color": "red", "vertex_index": 1}],
+            )
+        with self.assertRaisesRegex(EpisodeValidationError, "越界"):
+            backend.confirm_points(
+                "episode_0005",
+                cloud.cloud_id,
+                2,
+                [{"id": "marker-red", "color": "red", "vertex_index": 99}],
+            )
 
     def test_scan_reports_non_uint16_depth(self):
         _write_episode(

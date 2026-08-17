@@ -6,7 +6,7 @@
 本地联调（无相机无机器人）:
     python run_server.py --camera-source mock --pose-source mock
 
-H2 真机（ZMQ RGB-D + DDS 只读 rt/lowstate + IK_replay FK，右臂）:
+H2 真机（ZMQ RGB-D + DDS 只读 rt/lowstate + 项目内 H2 FK，右臂）:
     python run_server.py --camera-source zmq --camera-host 127.0.0.1 \
         --pose-source h2 --network-interface eth0
 
@@ -24,6 +24,8 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
+
+from backend.paths import DEFAULT_RGBD_CALIB_PATH
 
 
 def main() -> int:
@@ -62,7 +64,7 @@ def main() -> int:
                         help="离线 robot-style 任务目录；设置后不占用 Orbbec 相机")
     parser.add_argument(
         "--rgbd-calib",
-        default="/home/robot/yx/project/IK_replay/config/camera/orbbec_rgbd_calibration.json",
+        default=str(DEFAULT_RGBD_CALIB_PATH),
         help="ZMQ 实时或离线原始深度到 RGB 的生产标定 JSON",
     )
 
