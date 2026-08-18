@@ -63,6 +63,11 @@ def main() -> int:
     parser.add_argument("--teleop-task-dir", default=None,
                         help="离线 robot-style 任务目录；设置后不占用 Orbbec 相机")
     parser.add_argument(
+        "--record-task-dir",
+        default=str(PROJECT_ROOT / "teleop_data" / "biaoding"),
+        help="Orbbec SDK 实时模式“拍摄当前姿态”的离线 episode 保存目录",
+    )
+    parser.add_argument(
         "--rgbd-calib",
         default=str(DEFAULT_RGBD_CALIB_PATH),
         help="ZMQ 实时或离线原始深度到 RGB 的生产标定 JSON",
@@ -166,10 +171,17 @@ def main() -> int:
     app_module.teleop_task_dir = (
         offline_backend.task_dir if offline_backend is not None else None
     )
+    app_module.record_task_dir = (
+        None
+        if offline_backend is not None
+        else Path(args.record_task_dir).expanduser().resolve()
+    )
     app_module.rgbd_calib_path = Path(args.rgbd_calib).expanduser().resolve()
     app_module.init_state()
 
     print(f"[handeye3d] save_path = {session_dir}")
+    if app_module.record_task_dir is not None:
+        print(f"[handeye3d] record_task_dir = {app_module.record_task_dir}")
     print(f"[handeye3d] serving on http://{args.host}:{args.port}")
 
     import uvicorn

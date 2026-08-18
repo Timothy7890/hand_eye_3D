@@ -6,6 +6,8 @@ const status = ref(null)
 const samples = ref([])
 const result = ref(null)
 const errorMsg = ref('')
+const recordBusy = ref(false)
+const recordMessage = ref('')
 
 // 当前待配对的一组数据
 const pick = ref(null)        // {p_camera, depth_mm, pixel, valid_ratio}
@@ -215,6 +217,28 @@ async function detectMarkers(episode = selectedEpisode.value) {
 
 async function refreshStatus() {
   status.value = await (await fetch('/api/status')).json()
+}
+
+async function recordEpisode() {
+  if (!status.value?.recording?.enabled || recordBusy.value) return
+  recordBusy.value = true
+  recordMessage.value = ''
+  errorMsg.value = ''
+  try {
+    const res = await fetch('/api/record/episode', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ frame_count: 5 }),
+    })
+    const data = await res.json()
+    if (!res.ok || !data.ok) throw new Error(data.error || '离线数据拍摄失败')
+    recordMessage.value = `${data.episode}：已保存 ${data.frame_count} 帧`
+    await refreshStatus()
+  } catch (e) {
+    errorMsg.value = e instanceof Error ? e.message : String(e)
+  } finally {
+    recordBusy.value = false
+  }
 }
 
 async function refreshSamples() {
@@ -776,14 +800,20 @@ function wristRpyDeg(T) {
   return [roll, pitch, yaw].map((a) => (a * 180 / Math.PI).toFixed(0)).join('/')
 }
 
-// 卸力摆位时单手不方便点鼠标：按空格 = 「保持当前位置」
+// 卸力时空格先保持当前位置；其余实时模式下空格拍摄一个离线 episode。
 function onKeyDown(ev) {
   if (ev.code !== 'Space' || ev.repeat) return
   const tag = ev.target?.tagName
-  if (tag === 'INPUT' || tag === 'TEXTAREA') return
-  if (!arm.value?.float || armBusy.value) return
-  ev.preventDefault()
-  armPost('stop')
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'BUTTON' || tag === 'SELECT') return
+  if (arm.value?.float && !armBusy.value) {
+    ev.preventDefault()
+    armPost('stop')
+    return
+  }
+  if (!offlineMode.value && status.value?.recording?.enabled && !recordBusy.value) {
+    ev.preventDefault()
+    recordEpisode()
+  }
 }
 
 onMounted(async () => {
@@ -1138,6 +1168,23 @@ onMounted(async () => {
         </template>
         <template v-else>
           <h2>1. 当前样本</h2>
+          <div v-if="status?.recording?.task_dir" class="field-row">
+            <label>离线数据</label>
+            <button
+              class="btn primary"
+              :disabled="!status?.recording?.enabled || recordBusy"
+              @click="recordEpisode"
+            >
+              {{ recordBusy ? '正在保存 5 帧…' : '拍摄当前姿态（空格）' }}
+            </button>
+            <span v-if="recordMessage" class="coord ok">{{ recordMessage }}</span>
+            <span v-else class="coord dim">
+              已有 {{ status?.recording?.episode_count || 0 }} 组
+            </span>
+          </div>
+          <div v-if="status?.recording?.task_dir" class="video-hint">
+            保存到 {{ status.recording.task_dir }}；机械臂保持静止后拍摄。
+          </div>
           <div class="field-row">
             <label>P_camera</label>
             <span v-if="pickBusy" class="coord dim">取点中…</span>

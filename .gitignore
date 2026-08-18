@@ -1,5 +1,6 @@
 # Runtime data
 /teleop_data/
+/teleop_data-old/
 /config/camera/orbbec_rgbd_calibration.json
 
 # Python caches and local environments

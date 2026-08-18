@@ -41,7 +41,13 @@ fi
 echo "[start] Python: $PY"
 IFACE="${NETWORK_INTERFACE:-enp86s0}"
 CAMERA_HOST="${CAMERA_HOST:-127.0.0.1}"
-RGBD_CALIB="${RGBD_CALIB:-$PWD/config/camera/orbbec_rgbd_calibration.json}"
+if [ -n "${RGBD_CALIB:-}" ]; then
+  RGBD_CALIB="$RGBD_CALIB"
+elif [ -f "$PWD/config/camera/orbbec_rgbd_calibration.json" ]; then
+  RGBD_CALIB="$PWD/config/camera/orbbec_rgbd_calibration.json"
+else
+  RGBD_CALIB="/home/robot/yx/project/IK_replay/config/camera/orbbec_rgbd_calibration.json"
+fi
 
 ARM_ARGS=(--arm-control)
 EXTRA=()

@@ -501,5 +501,89 @@ class BatchSampleApiTest(unittest.TestCase):
                 app_module.offline_backend = old_offline_backend
 
 
+class LiveEpisodeRecorderTest(unittest.TestCase):
+    def test_records_sdk_frames_in_offline_compatible_layout(self):
+        from backend import app as app_module
+
+        class FakeCamera:
+            source = "orbbec"
+
+            def __init__(self):
+                self.sequence = 0
+
+            @staticmethod
+            def info():
+                return {
+                    "source": "orbbec",
+                    "serial": "TEST",
+                    "recording_supported": True,
+                }
+
+            def wait_record_frame(self, _after_sequence, timeout_s=2.0):
+                del timeout_s
+                sequence = self.sequence
+                self.sequence += 1
+                return {
+                    "sequence": sequence,
+                    "timestamp_ns": 1000 + sequence,
+                    "color_bgr": np.full((3, 4, 3), 20 + sequence, np.uint8),
+                    "depth_z16": np.full((3, 4), 900 + sequence, np.uint16),
+                    "depth_scale_mm": 1.0,
+                }
+
+        old_values = {
+            "camera": app_module.camera,
+            "pose_provider": app_module.pose_provider,
+            "offline_backend": app_module.offline_backend,
+            "record_task_dir": app_module.record_task_dir,
+            "rgbd_calib_path": app_module.rgbd_calib_path,
+            "save_path": app_module.save_path,
+        }
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            calibration_path = root / "rgbd.json"
+            _write_calibration(calibration_path)
+            try:
+                app_module.camera = FakeCamera()
+                app_module.pose_provider = SimpleNamespace(
+                    source="h2",
+                    available=True,
+                    base_link="torso_link",
+                    wrist_link="right_wrist_yaw_link",
+                    read_arm_q=lambda: np.arange(7, dtype=float),
+                )
+                app_module.offline_backend = None
+                app_module.record_task_dir = root / "task"
+                app_module.rgbd_calib_path = calibration_path
+                app_module.save_path = root / "results"
+                app_module.init_state()
+
+                result = app_module._record_episode(5)
+                self.assertEqual(result["episode"], "episode_0000")
+                episode_root = root / "task" / "episode_0000"
+                payload = json.loads(
+                    (episode_root / "data.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(payload["info"]["kind"], "hand_eye_calibration")
+                self.assertEqual(payload["info"]["frame_count"], 5)
+                self.assertEqual(len(payload["data"]), 5)
+                self.assertEqual(
+                    payload["data"][0]["states"]["right_arm"]["qpos"],
+                    np.arange(7, dtype=float).tolist(),
+                )
+                depth = np.load(
+                    episode_root / payload["data"][0]["depths"]["head_depth"],
+                    allow_pickle=False,
+                )
+                self.assertEqual(depth.dtype, np.uint16)
+                self.assertEqual(depth.shape, (3, 4))
+                self.assertTrue(
+                    (episode_root / payload["data"][0]["colors"]["head_rgb"]).is_file()
+                )
+            finally:
+                for name, value in old_values.items():
+                    setattr(app_module, name, value)
+
+
 if __name__ == "__main__":
     unittest.main()

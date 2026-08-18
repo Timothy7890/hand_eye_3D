@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 import threading
 import time
 import uuid
 from datetime import datetime
 from pathlib import Path
 
+import cv2
 import numpy as np
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,9 +28,11 @@ from .offline import (
     EpisodeValidationError,
     OfflineEpisodeBackend,
     PointCloudStaleError,
+    RIGHT_ARM_DATASET_JOINTS,
 )
 from .markers import CANONICAL_COLORS, canonical_color, marker_catalog_public
 from .robot import ManualPoseProvider, PoseProvider
+from .rgbd import RGBDCalibration
 from .solver import (
     MIN_SAMPLES_PIVOT,
     MIN_SAMPLES_TOOL,
@@ -54,8 +58,10 @@ arm_lock = threading.Lock()
 save_path: Path = Path("./handeye3d_data")
 offline_backend: OfflineEpisodeBackend | None = None
 teleop_task_dir: Path | None = None
+record_task_dir: Path | None = None
 rgbd_calib_path: Path = DEFAULT_RGBD_CALIB_PATH
 samples_lock = threading.Lock()
+record_lock = threading.Lock()
 
 app = FastAPI(title="Hand-Eye 3D (point + wrist-pose) Calibration")
 app.add_middleware(
@@ -66,6 +72,8 @@ app.add_middleware(
 def init_state() -> None:
     (save_path / "samples").mkdir(parents=True, exist_ok=True)
     (save_path / "pivot_samples").mkdir(parents=True, exist_ok=True)
+    if record_task_dir is not None:
+        record_task_dir.mkdir(parents=True, exist_ok=True)
 
 
 def _samples_dir() -> Path:
@@ -132,6 +140,12 @@ def _active_camera_info() -> dict:
     }
 
 
+def _recorded_episode_count() -> int:
+    if record_task_dir is None or not record_task_dir.is_dir():
+        return 0
+    return sum(1 for path in record_task_dir.glob("episode_*/data.json") if path.is_file())
+
+
 # --------------- 状态 / 相机 ---------------
 
 
@@ -149,6 +163,17 @@ async def api_status():
         "min_samples": MIN_SAMPLES_TOOL,
         "teleop_task_dir": str(teleop_task_dir) if teleop_task_dir else None,
         "rgbd_calib": str(rgbd_calib_path),
+        "recording": {
+            "enabled": (
+                offline_backend is None
+                and record_task_dir is not None
+                and bool(_active_camera_info().get("recording_supported"))
+                and callable(getattr(pose_provider, "read_arm_q", None))
+            ),
+            "task_dir": str(record_task_dir) if record_task_dir else None,
+            "episode_count": _recorded_episode_count(),
+            "frame_count": 5,
+        },
         "offline": {
             "enabled": offline_backend is not None,
             "teleop_task_dir": str(teleop_task_dir) if teleop_task_dir else None,
@@ -156,6 +181,157 @@ async def api_status():
             "serial_mismatch_policy": "warning",
         },
     }
+
+
+def _next_record_episode_name() -> str:
+    assert record_task_dir is not None
+    used = []
+    for path in record_task_dir.glob("episode_*"):
+        if not path.is_dir():
+            continue
+        try:
+            used.append(int(path.name.removeprefix("episode_")))
+        except ValueError:
+            continue
+    return f"episode_{((max(used) + 1) if used else 0):04d}"
+
+
+def _record_episode(frame_count: int) -> dict:
+    if offline_backend is not None:
+        raise RuntimeError("离线处理模式不能继续拍摄")
+    if record_task_dir is None:
+        raise RuntimeError("未配置离线数据保存目录")
+    read_arm_q = getattr(pose_provider, "read_arm_q", None)
+    if not callable(read_arm_q):
+        raise RuntimeError("离线拍摄需要 --pose-source h2，以同步保存右臂关节角")
+    calibration = RGBDCalibration.from_file(rgbd_calib_path)
+    camera_info = _active_camera_info()
+    if not camera_info.get("recording_supported"):
+        raise RuntimeError("当前相机来源不支持原始 RGB-D 落盘；请使用 --camera-source orbbec")
+    if (
+        calibration.serial
+        and camera_info.get("serial")
+        and str(camera_info["serial"]) != calibration.serial
+    ):
+        raise RuntimeError(
+            f"相机序列号 {camera_info['serial']} 与 RGB-D 标定 {calibration.serial} 不一致"
+        )
+
+    episode_name = _next_record_episode_name()
+    final_root = record_task_dir / episode_name
+    temp_root = record_task_dir / f".{episode_name}-{uuid.uuid4().hex}.tmp"
+    rgb_dir = temp_root / "rgb"
+    depth_dir = temp_root / "depth"
+    rgb_dir.mkdir(parents=True)
+    depth_dir.mkdir()
+
+    rows = []
+    sequence = -1
+    try:
+        for index in range(frame_count):
+            frame = camera.wait_record_frame(sequence, timeout_s=2.0)
+            sequence = int(frame["sequence"])
+            color = np.asarray(frame["color_bgr"], dtype=np.uint8)
+            depth = np.asarray(frame["depth_z16"])
+            q = np.asarray(read_arm_q(), dtype=float).reshape(-1)
+            if color.shape[:2] != calibration.color_shape or color.ndim != 3:
+                raise RuntimeError(
+                    f"SDK 彩色帧尺寸 {color.shape[:2]} 与标定 "
+                    f"{calibration.color_shape} 不一致"
+                )
+            if depth.dtype != np.uint16 or depth.shape != calibration.depth_shape:
+                raise RuntimeError(
+                    f"SDK 原始深度应为 uint16 {calibration.depth_shape}，"
+                    f"实际为 {depth.dtype} {depth.shape}"
+                )
+            if q.shape != (7,) or not np.all(np.isfinite(q)):
+                raise RuntimeError(f"H2 右臂关节角应为 7 个有限数值，实际 shape={q.shape}")
+            depth_scale_mm = float(frame["depth_scale_mm"])
+            if not np.isclose(
+                depth_scale_mm, calibration.depth_scale_mm, rtol=0.0, atol=1e-6
+            ):
+                raise RuntimeError(
+                    f"SDK depth scale {depth_scale_mm} mm 与标定 "
+                    f"{calibration.depth_scale_mm} mm 不一致"
+                )
+
+            rgb_rel = Path("rgb") / f"{index:06d}_head_rgb.jpg"
+            depth_rel = Path("depth") / f"{index:06d}_head_depth.npy"
+            if not cv2.imwrite(
+                str(temp_root / rgb_rel), color, [cv2.IMWRITE_JPEG_QUALITY, 95]
+            ):
+                raise RuntimeError(f"无法写入彩色帧 {rgb_rel}")
+            np.save(temp_root / depth_rel, depth, allow_pickle=False)
+            rows.append(
+                {
+                    "idx": index,
+                    "colors": {"head_rgb": rgb_rel.as_posix()},
+                    "depths": {"head_depth": depth_rel.as_posix()},
+                    "states": {"right_arm": {"qpos": q.tolist()}},
+                    "timestamps": {
+                        "sample_timestamp_ns": int(frame["timestamp_ns"]),
+                        "joint_read_timestamp_ns": time.time_ns(),
+                    },
+                    "rgbd": {
+                        "color_shape": list(color.shape[:2]),
+                        "depth_shape": list(depth.shape),
+                        "color_format": "jpeg",
+                        "depth_format": "depth_z16",
+                        "depth_dtype": "uint16",
+                        "depth_scale_mm": depth_scale_mm,
+                        "alignment": "raw_depth",
+                    },
+                }
+            )
+
+        payload = {
+            "info": {
+                "version": "1.0.0",
+                "kind": "hand_eye_calibration",
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "frame_count": len(rows),
+                "robot": "H2",
+                "camera_serial": camera_info.get("serial"),
+                "camera_source": camera_info.get("source"),
+                "right_arm_joint_order": list(RIGHT_ARM_DATASET_JOINTS),
+            },
+            "data": rows,
+        }
+        (temp_root / "data.json").write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        temp_root.replace(final_root)
+    except Exception:
+        shutil.rmtree(temp_root, ignore_errors=True)
+        raise
+    return {
+        "ok": True,
+        "episode": episode_name,
+        "frame_count": len(rows),
+        "path": str(final_root),
+    }
+
+
+@app.post("/api/record/episode")
+async def api_record_episode(body: dict | None = None):
+    body = body or {}
+    try:
+        frame_count = int(body.get("frame_count", 5))
+    except (TypeError, ValueError):
+        return JSONResponse({"ok": False, "error": "frame_count 必须是整数"}, status_code=400)
+    if not 3 <= frame_count <= 30:
+        return JSONResponse(
+            {"ok": False, "error": "frame_count 必须在 3～30 之间"}, status_code=400
+        )
+    if not record_lock.acquire(blocking=False):
+        return JSONResponse({"ok": False, "error": "正在拍摄上一组数据"}, status_code=409)
+    try:
+        result = await asyncio.to_thread(_record_episode, frame_count)
+        return result
+    except (OSError, RuntimeError, ValueError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
+    finally:
+        record_lock.release()
 
 
 @app.get("/api/markers/colors")

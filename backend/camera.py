@@ -37,6 +37,10 @@ class CameraBase:
         """返回 (多帧中值深度图 mm, 彩色内参 fx/fy/cx/cy)，无数据时 None。"""
         return None
 
+    def wait_record_frame(self, after_sequence: int, timeout_s: float = 2.0) -> dict:
+        """等待一帧可落盘的同步原始 RGB-D；仅直接 SDK 相机支持。"""
+        raise RuntimeError(f"{self.source} 相机不支持原始 RGB-D 落盘")
+
     def info(self) -> dict:
         return {"source": self.source}
 
@@ -96,8 +100,14 @@ class OrbbecRGBDCamera(CameraBase):
         self.height = 0
         self.intrinsics = None  # (fx, fy, cx, cy) 彩色相机内参
         self._lock = threading.Lock()
+        self._record_condition = threading.Condition(self._lock)
         self._color_bgr = None
         self._depth_hist: deque[np.ndarray] = deque(maxlen=DEPTH_HISTORY)
+        self._record_sequence = -1
+        self._record_frame: dict | None = None
+        self.raw_depth_width = 0
+        self.raw_depth_height = 0
+        self.raw_depth_scale_mm = 0.0
         self._stop_evt = threading.Event()
         self._thread: threading.Thread | None = None
         self.error: str | None = None
@@ -144,6 +154,8 @@ class OrbbecRGBDCamera(CameraBase):
 
         self.width = color_profile.get_width()
         self.height = color_profile.get_height()
+        self.raw_depth_width = depth_profile.get_width()
+        self.raw_depth_height = depth_profile.get_height()
         intr = color_profile.get_intrinsic()
         self.intrinsics = (intr.fx, intr.fy, intr.cx, intr.cy)
 
@@ -235,17 +247,26 @@ class OrbbecRGBDCamera(CameraBase):
                 frames = self._pipeline.wait_for_frames(200)
                 if frames is None:
                     continue
-                frames = self._align.process(frames)
-                if not frames:
+                raw_frames = frames.as_frame_set()
+                raw_color = raw_frames.get_color_frame()
+                raw_depth = raw_frames.get_depth_frame()
+                if raw_color is None or raw_depth is None:
                     continue
-                frames = frames.as_frame_set()
-                color = frames.get_color_frame()
-                depth = frames.get_depth_frame()
-                if color is None or depth is None:
-                    continue
-
-                bgr = self._decode_color(color)
+                bgr = self._decode_color(raw_color)
                 if bgr is None:
+                    continue
+                raw_dw, raw_dh = raw_depth.get_width(), raw_depth.get_height()
+                raw_depth_scale = float(raw_depth.get_depth_scale())
+                raw_depth_z16 = np.frombuffer(
+                    raw_depth.get_data(), np.uint16
+                ).reshape(raw_dh, raw_dw).copy()
+
+                aligned = self._align.process(frames)
+                if not aligned:
+                    continue
+                aligned_frames = aligned.as_frame_set()
+                depth = aligned_frames.get_depth_frame()
+                if depth is None:
                     continue
 
                 dw, dh = depth.get_width(), depth.get_height()
@@ -253,10 +274,22 @@ class OrbbecRGBDCamera(CameraBase):
                 depth_mm = np.frombuffer(depth.get_data(), np.uint16).reshape(dh, dw)
                 depth_mm = depth_mm.astype(np.float32) * scale
 
-                with self._lock:
+                with self._record_condition:
+                    self._record_sequence += 1
                     self._color_bgr = bgr
                     self._depth_hist.append(depth_mm)
+                    self.raw_depth_width = raw_dw
+                    self.raw_depth_height = raw_dh
+                    self.raw_depth_scale_mm = raw_depth_scale
+                    self._record_frame = {
+                        "sequence": self._record_sequence,
+                        "timestamp_ns": time.time_ns(),
+                        "color_bgr": bgr,
+                        "depth_z16": raw_depth_z16,
+                        "depth_scale_mm": raw_depth_scale,
+                    }
                     self.error = None
+                    self._record_condition.notify_all()
             except Exception as e:
                 self.error = str(e)
                 time.sleep(0.2)
@@ -278,6 +311,26 @@ class OrbbecRGBDCamera(CameraBase):
         return None
 
     # ---- 数据接口 ----
+
+    def wait_record_frame(self, after_sequence: int, timeout_s: float = 2.0) -> dict:
+        deadline = time.monotonic() + timeout_s
+        with self._record_condition:
+            while (
+                self._record_frame is None
+                or int(self._record_frame["sequence"]) <= int(after_sequence)
+            ):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"{timeout_s:.1f}s 内没有收到新的 Orbbec RGB-D 帧")
+                self._record_condition.wait(remaining)
+            frame = self._record_frame
+            return {
+                "sequence": int(frame["sequence"]),
+                "timestamp_ns": int(frame["timestamp_ns"]),
+                "color_bgr": frame["color_bgr"].copy(),
+                "depth_z16": frame["depth_z16"].copy(),
+                "depth_scale_mm": float(frame["depth_scale_mm"]),
+            }
 
     def get_jpeg(self) -> bytes | None:
         with self._lock:
@@ -345,6 +398,10 @@ class OrbbecRGBDCamera(CameraBase):
         return {
             "source": self.source, "serial": self.serial, "name": self.name,
             "width": self.width, "height": self.height,
+            "raw_depth_width": self.raw_depth_width,
+            "raw_depth_height": self.raw_depth_height,
+            "raw_depth_scale_mm": self.raw_depth_scale_mm,
+            "recording_supported": True,
             "intrinsics": {"fx": fx, "fy": fy, "cx": cx, "cy": cy},
             "error": self.error,
         }
