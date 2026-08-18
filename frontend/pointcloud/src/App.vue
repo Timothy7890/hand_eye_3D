@@ -45,9 +45,7 @@ const episodeSamples = computed(() =>
 )
 const savedColors = computed(() => new Set(episodeSamples.value.map((sample) => sample.color)))
 const selectedColors = computed(() => new Set(selections.value.map((item) => item.color)))
-const selectableColors = computed(() =>
-  markerColors.value.filter((item) => !savedColors.value.has(item.color)),
-)
+const selectableColors = computed(() => markerColors.value)
 const canSave = computed(() =>
   selections.value.length > 0 && !cloudBusy.value && !saveBusy.value && Boolean(cloudId.value),
 )
@@ -150,6 +148,64 @@ function frameCloud(geometry) {
   controls.update()
 }
 
+function restoreSavedSelections(geometry) {
+  const saved = episodeSamples.value.filter((sample) =>
+    Array.isArray(sample.p_camera) && sample.p_camera.length === 3,
+  )
+  const position = geometry?.getAttribute('position')
+  if (!position || !saved.length) {
+    selections.value = []
+    refreshHighlights()
+    return 0
+  }
+
+  const restored = saved.map((sample) => {
+    const target = sample.p_camera.map(Number)
+    const savedCloudId = sample.cloud_id || sample.provenance?.cloud_id
+    const savedStride = Number(sample.point_cloud_stride || sample.provenance?.point_cloud_stride)
+    const savedIndex = Number(sample.vertex_index ?? sample.provenance?.vertex_index)
+    let vertexIndex = -1
+
+    if (
+      savedCloudId === cloudId.value
+      && savedStride === cloudStride.value
+      && Number.isInteger(savedIndex)
+      && savedIndex >= 0
+      && savedIndex < position.count
+    ) {
+      vertexIndex = savedIndex
+    } else {
+      let nearestDistanceSq = Infinity
+      for (let index = 0; index < position.count; index += 1) {
+        const dx = position.getX(index) - target[0]
+        const dy = position.getY(index) - target[1]
+        const dz = position.getZ(index) - target[2]
+        const distanceSq = dx * dx + dy * dy + dz * dz
+        if (distanceSq < nearestDistanceSq) {
+          nearestDistanceSq = distanceSq
+          vertexIndex = index
+        }
+      }
+    }
+
+    const point = vertexIndex >= 0
+      ? [position.getX(vertexIndex), position.getY(vertexIndex), position.getZ(vertexIndex)]
+      : target
+    return {
+      color: sample.color,
+      vertexIndex,
+      point,
+      displayPoint: [...point],
+      sampleIndex: sample.index,
+      restored: true,
+    }
+  }).filter((item) => item.vertexIndex >= 0)
+
+  selections.value = restored
+  refreshHighlights()
+  return restored.length
+}
+
 async function loadPointCloud() {
   const episode = selectedEpisode.value
   if (!episode || !renderer) return
@@ -193,7 +249,10 @@ async function loadPointCloud() {
     pointCount.value = Number.isFinite(count) ? count : geometry.getAttribute('position').count
     cloudStride.value = Number.isFinite(stride) ? stride : cloudStride.value
     frameCloud(geometry)
-    infoMsg.value = `已加载 ${pointCount.value.toLocaleString()} 个稳定点`
+    const restoredCount = restoreSavedSelections(geometry)
+    infoMsg.value = restoredCount
+      ? `已恢复 ${restoredCount} 个已保存选点，可选择颜色后重新选点`
+      : `已加载 ${pointCount.value.toLocaleString()} 个稳定点`
   } catch (error) {
     if (serial === requestSerial) setError(error)
   } finally {
@@ -249,7 +308,15 @@ function onPointerUp(event) {
     .toArray()
   const color = activeColor.value
   const next = selections.value.filter((item) => item.color !== color)
-  next.push({ color, vertexIndex: hit.index, point, displayPoint })
+  const previous = selections.value.find((item) => item.color === color)
+  next.push({
+    color,
+    vertexIndex: hit.index,
+    point,
+    displayPoint,
+    sampleIndex: previous?.sampleIndex,
+    restored: false,
+  })
   selections.value = next
   infoMsg.value = `${colorInfo(color).label_zh}选点已更新（距点击 ${screenDistancePx.toFixed(1)} px）`
   refreshHighlights()
@@ -330,7 +397,7 @@ async function loadWorkspace() {
     if (!episodes.value.some((item) => item.name === selectedEpisode.value)) {
       selectedEpisode.value = episodes.value[0]?.name || ''
     }
-    activeColor.value = selectableColors.value[0]?.color || ''
+    activeColor.value = episodeSamples.value[0]?.color || selectableColors.value[0]?.color || ''
   } catch (error) {
     setError(error)
   }
@@ -339,7 +406,7 @@ async function loadWorkspace() {
 async function selectEpisode(name) {
   if (name === selectedEpisode.value || cloudBusy.value) return
   selectedEpisode.value = name
-  activeColor.value = selectableColors.value[0]?.color || ''
+  activeColor.value = episodeSamples.value[0]?.color || selectableColors.value[0]?.color || ''
   await nextTick()
   await loadPointCloud()
 }
@@ -374,15 +441,16 @@ async function confirmAndSave() {
       body: JSON.stringify({
         episode: selectedEpisode.value,
         observations: confirmation.observations,
+        replace_existing: true,
       }),
     })
     if (!saveResponse.ok) throw await responseError(saveResponse, '样本保存失败')
     const saved = await saveResponse.json()
-    infoMsg.value = `已保存 ${saved.indices?.length || selections.value.length} 个点云观测`
-    selections.value = []
-    refreshHighlights()
     await loadWorkspace()
-    activeColor.value = selectableColors.value[0]?.color || ''
+    if (cloudObject) restoreSavedSelections(cloudObject.geometry)
+    infoMsg.value = saved.updated_count
+      ? `已更新 ${saved.updated_count} 个点云观测`
+      : `已保存 ${saved.indices?.length || selections.value.length} 个点云观测`
   } catch (error) {
     setError(error)
   } finally {
@@ -533,7 +601,6 @@ onBeforeUnmount(() => {
                 selected: selectedColors.has(marker.color),
                 saved: savedColors.has(marker.color),
               }"
-              :disabled="savedColors.has(marker.color)"
               @click="activeColor = marker.color"
             >
               <i :style="{ background: marker.display_color }"></i>

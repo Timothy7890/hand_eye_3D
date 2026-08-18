@@ -1001,11 +1001,14 @@ async def api_add_samples_batch(body: dict):
     try:
         episode = body["episode"]
         observations = body["observations"]
+        replace_existing = body.get("replace_existing", False)
         if not isinstance(episode, str) or not episode.strip():
             raise ValueError("episode 必须是非空字符串")
         episode = episode.strip()
         if not isinstance(observations, list) or not observations:
             raise ValueError("observations 必须是非空数组")
+        if not isinstance(replace_existing, bool):
+            raise ValueError("replace_existing 必须是布尔值")
         records = [
             _validated_v2_observation(observation, episode, position)
             for position, observation in enumerate(observations)
@@ -1047,38 +1050,49 @@ async def api_add_samples_batch(body: dict):
             for sample in existing_v2
             if sample.get("color") in CANONICAL_COLORS
         }
-        for record in records:
-            duplicate = existing_keys.get((episode, record["marker_id"]))
-            if duplicate is not None:
-                return JSONResponse(
-                    {
-                        "ok": False,
-                        "error": f"episode {episode} 的 marker "
-                        f"{record['marker_id']} 已导入为样本 {duplicate.get('index')}",
-                        "duplicate_key": [episode, record["marker_id"]],
-                        "existing_index": duplicate.get("index"),
-                    },
-                    status_code=409,
-                )
-            same_color = existing_colors.get(record["color"])
-            if same_color is not None:
-                return JSONResponse(
-                    {
-                        "ok": False,
-                        "error": f"episode {episode} 已保存 {record['color']} marker "
-                        f"为样本 {same_color.get('index')}",
-                        "duplicate_color": record["color"],
-                        "existing_index": same_color.get("index"),
-                    },
-                    status_code=409,
-                )
+        if not replace_existing:
+            for record in records:
+                duplicate = existing_keys.get((episode, record["marker_id"]))
+                if duplicate is not None:
+                    return JSONResponse(
+                        {
+                            "ok": False,
+                            "error": f"episode {episode} 的 marker "
+                            f"{record['marker_id']} 已导入为样本 {duplicate.get('index')}",
+                            "duplicate_key": [episode, record["marker_id"]],
+                            "existing_index": duplicate.get("index"),
+                        },
+                        status_code=409,
+                    )
+                same_color = existing_colors.get(record["color"])
+                if same_color is not None:
+                    return JSONResponse(
+                        {
+                            "ok": False,
+                            "error": f"episode {episode} 已保存 {record['color']} marker "
+                            f"为样本 {same_color.get('index')}",
+                            "duplicate_color": record["color"],
+                            "existing_index": same_color.get("index"),
+                        },
+                        status_code=409,
+                    )
 
-        first_index = _next_index()
-        indices = list(range(first_index, first_index + len(records)))
+        next_index = _next_index()
+        indices: list[int] = []
+        updated_count = 0
+        for record in records:
+            previous = existing_colors.get(record["color"]) if replace_existing else None
+            if previous is not None:
+                indices.append(int(previous["index"]))
+                updated_count += 1
+            else:
+                indices.append(next_index)
+                next_index += 1
         now = datetime.now().isoformat(timespec="seconds")
         token = uuid.uuid4().hex
         staged: list[tuple[Path, Path]] = []
         installed: list[Path] = []
+        previous_contents: dict[Path, str | None] = {}
         try:
             for index, record in zip(indices, records):
                 saved = dict(record)
@@ -1095,6 +1109,9 @@ async def api_add_samples_batch(body: dict):
                 )
                 final_path = _samples_dir() / f"{index:04d}.json"
                 temp_path = _samples_dir() / f".batch-{token}-{index:04d}.tmp"
+                previous_contents[final_path] = (
+                    final_path.read_text(encoding="utf-8") if final_path.exists() else None
+                )
                 temp_path.write_text(
                     json.dumps(saved, indent=2, ensure_ascii=False), encoding="utf-8"
                 )
@@ -1106,7 +1123,11 @@ async def api_add_samples_batch(body: dict):
             for temp_path, _ in staged:
                 temp_path.unlink(missing_ok=True)
             for final_path in installed:
-                final_path.unlink(missing_ok=True)
+                previous = previous_contents.get(final_path)
+                if previous is None:
+                    final_path.unlink(missing_ok=True)
+                else:
+                    final_path.write_text(previous, encoding="utf-8")
             return JSONResponse(
                 {"ok": False, "error": f"批量保存失败，未保留部分结果: {exc}"},
                 status_code=500,
@@ -1116,6 +1137,7 @@ async def api_add_samples_batch(body: dict):
         "episode": episode,
         "indices": indices,
         "saved_count": len(indices),
+        "updated_count": updated_count,
         "count": len(_load_samples()),
     }
 

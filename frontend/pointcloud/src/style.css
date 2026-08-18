@@ -442,7 +442,7 @@ button:disabled {
 }
 
 .color-chip.saved {
-  opacity: 0.48;
+  border-color: #285743;
 }
 
 .color-chip.saved::after {
