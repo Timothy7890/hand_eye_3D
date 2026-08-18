@@ -61,6 +61,19 @@ if [ "$OFFLINE" -eq 1 ]; then
   echo "离线遥操作数据模式：不打开相机、不连接或控制机器人。"
 fi
 
+VITE_BIN="$PWD/frontend/node_modules/.bin/vite"
+if [ ! -x "$VITE_BIN" ]; then
+  echo "[start] 前端依赖未安装（缺少 frontend/node_modules/.bin/vite），正在 npm install ..."
+  if ! (cd frontend && npm install); then
+    echo "[start] npm install 失败。请手动执行: cd frontend && npm install" >&2
+    exit 1
+  fi
+fi
+if [ ! -x "$VITE_BIN" ]; then
+  echo "[start] 仍找不到 $VITE_BIN，无法启动 7012/7013。" >&2
+  exit 1
+fi
+
 for port in 8132 7012 7013; do
   if ! "$PY" -c \
     "import socket, sys; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(('0.0.0.0', int(sys.argv[1]))); s.close()" \
@@ -112,18 +125,29 @@ if ! kill -0 "$BACK_PID" 2>/dev/null; then
   exit 1
 fi
 
-(cd frontend && exec ./node_modules/.bin/vite) &
+(cd frontend && exec "$VITE_BIN") &
 FRONT_IMAGE_PID=$!
-(cd frontend && exec ./node_modules/.bin/vite --config vite.pointcloud.config.js) &
+(cd frontend && exec "$VITE_BIN" --config vite.pointcloud.config.js) &
 FRONT_CLOUD_PID=$!
 
+sleep 1
+if ! kill -0 "$FRONT_IMAGE_PID" 2>/dev/null || ! kill -0 "$FRONT_CLOUD_PID" 2>/dev/null; then
+  echo "[start] 前端 Vite 启动失败，7012/7013 将无法访问。" >&2
+  cleanup
+fi
+
+echo "[start] 后端/前端均监听 0.0.0.0，本机所有网卡 IP 都可访问："
 if hostname -I >/dev/null 2>&1; then
-  IP="$(hostname -I | awk '{print $1}')"
+  for IP in $(hostname -I); do
+    echo "         后端 http://${IP}:8132"
+    echo "         图像选点 http://${IP}:7012   点云选点 http://${IP}:7013"
+  done
 else
   IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo 127.0.0.1)"
+  echo "         后端 http://${IP}:8132"
+  echo "         图像选点 http://${IP}:7012   点云选点 http://${IP}:7013"
 fi
-echo "[start] 后端 http://${IP}:8132"
-echo "[start] 图像选点 http://${IP}:7012   点云选点 http://${IP}:7013   （Ctrl+C 一起退出）"
+echo "[start] Ctrl+C 一起退出"
 
 wait "$FRONT_IMAGE_PID" "$FRONT_CLOUD_PID" "$BACK_PID"
 cleanup
