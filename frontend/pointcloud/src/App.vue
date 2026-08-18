@@ -217,19 +217,39 @@ function onPointerUp(event) {
   const raycaster = new THREE.Raycaster()
   raycaster.params.Points.threshold = Math.max(0.003, pointSize.value / 700)
   raycaster.setFromCamera(mouse, camera)
-  const hit = raycaster.intersectObject(cloudObject, false)[0]
-  if (!hit || hit.index == null) {
+  cloudObject.updateMatrixWorld(true)
+  const position = cloudObject.geometry.getAttribute('position')
+  const candidate = raycaster
+    .intersectObject(cloudObject, false)
+    .filter((hit) => hit.index != null)
+    .map((hit) => {
+      const projected = new THREE.Vector3(
+        position.getX(hit.index),
+        position.getY(hit.index),
+        position.getZ(hit.index),
+      )
+        .applyMatrix4(cloudObject.matrixWorld)
+        .project(camera)
+      const dx = (projected.x - mouse.x) * rect.width / 2
+      const dy = (projected.y - mouse.y) * rect.height / 2
+      return { hit, screenDistancePx: Math.hypot(dx, dy) }
+    })
+    .sort((a, b) => a.screenDistancePx - b.screenDistancePx)[0]
+  if (!candidate) {
     infoMsg.value = '没有命中点，请放大后重试'
     return
   }
 
-  const position = cloudObject.geometry.getAttribute('position')
+  const { hit, screenDistancePx } = candidate
   const point = [position.getX(hit.index), position.getY(hit.index), position.getZ(hit.index)]
+  const displayPoint = new THREE.Vector3(...point)
+    .applyMatrix4(cloudObject.matrixWorld)
+    .toArray()
   const color = activeColor.value
   const next = selections.value.filter((item) => item.color !== color)
-  next.push({ color, vertexIndex: hit.index, point })
+  next.push({ color, vertexIndex: hit.index, point, displayPoint })
   selections.value = next
-  infoMsg.value = `${colorInfo(color).label_zh}选点已更新`
+  infoMsg.value = `${colorInfo(color).label_zh}选点已更新（距点击 ${screenDistancePx.toFixed(1)} px）`
   refreshHighlights()
   chooseNextColor()
 }
@@ -250,10 +270,15 @@ function refreshHighlights() {
   for (const selection of selections.value) {
     const marker = colorInfo(selection.color)
     const mesh = new THREE.Mesh(
-      new THREE.SphereGeometry(0.009, 16, 12),
+      new THREE.SphereGeometry(0.0035, 16, 12),
       new THREE.MeshBasicMaterial({ color: marker.display_color }),
     )
-    mesh.position.set(selection.point[0], -selection.point[1], selection.point[2])
+    const displayPoint = selection.displayPoint || [
+      selection.point[0],
+      -selection.point[1],
+      selection.point[2],
+    ]
+    mesh.position.fromArray(displayPoint)
     markerGroup.add(mesh)
   }
 }

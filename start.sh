@@ -10,10 +10,35 @@ set -u
 
 cd "$(dirname "$0")"
 
-PY="${PYTHON:-$HOME/miniconda3/envs/fastapi/bin/python}"
-if [ ! -x "$PY" ]; then
-  PY="$(command -v python3 || command -v python)"
+PY="${PYTHON:-}"
+if [ -z "$PY" ]; then
+  PY_CANDIDATES=(
+    "$HOME/miniconda3/envs/fastapi/bin/python"
+    "$HOME/anaconda3/envs/fastapi/bin/python"
+    "/opt/anaconda3/envs/fastapi/bin/python"
+    "/opt/miniconda3/envs/fastapi/bin/python"
+  )
+  if [ -n "${CONDA_PREFIX:-}" ]; then
+    PY_CANDIDATES+=(
+      "$CONDA_PREFIX/bin/python"
+      "$CONDA_PREFIX/envs/fastapi/bin/python"
+    )
+  fi
+  for candidate in "${PY_CANDIDATES[@]}"; do
+    if [ -x "$candidate" ] &&
+       "$candidate" -c "import cv2, fastapi, numpy, uvicorn, yaml" >/dev/null 2>&1; then
+      PY="$candidate"
+      break
+    fi
+  done
 fi
+if [ -z "$PY" ] || [ ! -x "$PY" ] ||
+   ! "$PY" -c "import cv2, fastapi, numpy, uvicorn, yaml" >/dev/null 2>&1; then
+  echo "[start] 找不到包含 numpy/cv2/fastapi/uvicorn/yaml 的 Python 环境。" >&2
+  echo "请设置 PYTHON=/path/to/conda/env/bin/python 后重试。" >&2
+  exit 1
+fi
+echo "[start] Python: $PY"
 IFACE="${NETWORK_INTERFACE:-enp86s0}"
 CAMERA_HOST="${CAMERA_HOST:-127.0.0.1}"
 RGBD_CALIB="${RGBD_CALIB:-$PWD/config/camera/orbbec_rgbd_calibration.json}"
@@ -36,6 +61,15 @@ if [ "$OFFLINE" -eq 1 ]; then
   echo "离线遥操作数据模式：不打开相机、不连接或控制机器人。"
 fi
 
+for port in 8132 7012 7013; do
+  if ! "$PY" -c \
+    "import socket, sys; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(('0.0.0.0', int(sys.argv[1]))); s.close()" \
+    "$port" >/dev/null 2>&1; then
+    echo "[start] 端口 $port 已被占用。请先结束旧的标定进程再重试。" >&2
+    exit 1
+  fi
+done
+
 if [ ${#ARM_ARGS[@]} -gt 0 ]; then
   echo "手臂控制可用：网页里点「获取控制」后才发布 rt/arm_sdk（获取前请确认没有其他控制程序）。"
   echo "（完全不需要动手臂就用 ./start.sh --no-arm）"
@@ -55,10 +89,21 @@ cleanup() {
 }
 trap cleanup INT TERM
 
-"$PY" run_server.py \
-  --camera-source zmq --camera-host "$CAMERA_HOST" --rgbd-calib "$RGBD_CALIB" \
-  --pose-source h2 --network-interface "$IFACE" \
-  "${ARM_ARGS[@]}" "${EXTRA[@]}" &
+SERVER_ARGS=(
+  --camera-source zmq
+  --camera-host "$CAMERA_HOST"
+  --rgbd-calib "$RGBD_CALIB"
+  --pose-source h2
+  --network-interface "$IFACE"
+)
+if [ ${#ARM_ARGS[@]} -gt 0 ]; then
+  SERVER_ARGS+=("${ARM_ARGS[@]}")
+fi
+if [ ${#EXTRA[@]} -gt 0 ]; then
+  SERVER_ARGS+=("${EXTRA[@]}")
+fi
+
+"$PY" run_server.py "${SERVER_ARGS[@]}" &
 BACK_PID=$!
 
 sleep 1
@@ -67,9 +112,9 @@ if ! kill -0 "$BACK_PID" 2>/dev/null; then
   exit 1
 fi
 
-(cd frontend && npm run dev --silent) &
+(cd frontend && exec ./node_modules/.bin/vite) &
 FRONT_IMAGE_PID=$!
-(cd frontend && npm run dev:pointcloud --silent) &
+(cd frontend && exec ./node_modules/.bin/vite --config vite.pointcloud.config.js) &
 FRONT_CLOUD_PID=$!
 
 if hostname -I >/dev/null 2>&1; then
