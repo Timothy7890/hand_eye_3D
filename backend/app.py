@@ -364,6 +364,103 @@ async def api_stream():
                              headers={"Cache-Control": "no-cache"})
 
 
+@app.get("/api/frame.jpg")
+async def api_live_frame():
+    """单帧 RGB，供不稳定支持 MJPEG 的浏览器轮询。"""
+    if offline_backend is not None:
+        return JSONResponse(
+            {"ok": False, "error": "离线模式没有实时相机流"}, status_code=409
+        )
+    data = await asyncio.to_thread(camera.get_jpeg)
+    if data is None:
+        return JSONResponse({"ok": False, "error": "相机还没有 RGB 帧"}, status_code=503)
+    return Response(
+        content=data,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+    )
+
+
+def _encode_live_depth_overlay(depth_mm: np.ndarray) -> bytes:
+    depth = np.asarray(depth_mm, dtype=np.float32)
+    if depth.ndim != 2:
+        raise ValueError(f"实时深度必须是二维图，实际 shape={depth.shape}")
+    valid = np.isfinite(depth) & (depth >= 300.0) & (depth <= 2000.0)
+    normalized = np.zeros(depth.shape, dtype=np.uint8)
+    normalized[valid] = np.clip(
+        (2000.0 - depth[valid]) * (255.0 / 1700.0), 0.0, 255.0
+    ).astype(np.uint8)
+    color = cv2.applyColorMap(normalized, cv2.COLORMAP_TURBO)
+    overlay = cv2.cvtColor(color, cv2.COLOR_BGR2BGRA)
+    overlay[..., 3] = np.where(valid, 255, 0).astype(np.uint8)
+    ok, encoded = cv2.imencode(".png", overlay, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+    if not ok:
+        raise RuntimeError("实时深度伪彩 PNG 编码失败")
+    return encoded.tobytes()
+
+
+@app.get("/api/depth-overlay.png")
+async def api_live_depth_overlay():
+    """单帧 SDK 对齐深度伪彩，和 RGB 单帧轮询配合使用。"""
+    if offline_backend is not None:
+        return JSONResponse(
+            {"ok": False, "error": "离线模式请使用 episode 深度叠加"},
+            status_code=409,
+        )
+    snapshot_reader = getattr(camera, "depth_preview_snapshot", camera.depth_snapshot)
+    snapshot = await asyncio.to_thread(snapshot_reader)
+    if snapshot is None:
+        return JSONResponse({"ok": False, "error": "相机还没有深度帧"}, status_code=503)
+    depth_mm, _intrinsics = snapshot
+    data = await asyncio.to_thread(_encode_live_depth_overlay, depth_mm)
+    return Response(
+        content=data,
+        media_type="image/png",
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+    )
+
+
+@app.get("/api/depth-stream")
+async def api_depth_stream():
+    """SDK 对齐到彩色分辨率后的实时深度伪彩 PNG 流。"""
+    if offline_backend is not None:
+        return JSONResponse(
+            {"ok": False, "error": "离线模式请使用 episode 深度叠加"},
+            status_code=409,
+        )
+
+    def gen():
+        snapshot_reader = getattr(
+            camera, "depth_preview_snapshot", camera.depth_snapshot
+        )
+        while True:
+            snapshot = snapshot_reader()
+            if snapshot is None:
+                time.sleep(0.1)
+                continue
+            depth_mm, _intrinsics = snapshot
+            try:
+                data = _encode_live_depth_overlay(depth_mm)
+            except (RuntimeError, ValueError):
+                time.sleep(0.1)
+                continue
+            yield (
+                b"--frame\r\nContent-Type: image/png\r\n"
+                b"Content-Length: "
+                + str(len(data)).encode()
+                + b"\r\n\r\n"
+                + data
+                + b"\r\n"
+            )
+            time.sleep(0.1)
+
+    return StreamingResponse(
+        gen(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
 @app.post("/api/pick")
 async def api_pick(body: dict):
     """点击像素反投影。Body: {"u": int, "v": int}，返回彩色相机系坐标（米）。"""

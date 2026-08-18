@@ -16,7 +16,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .rgbd import ZmqRGBDCamera
+from .rgbd import RGBDCalibration, ZmqRGBDCamera
 
 DEPTH_HISTORY = 8  # 保留最近 N 帧对齐深度做时域中值滤波
 
@@ -36,6 +36,12 @@ class CameraBase:
     def depth_snapshot(self) -> tuple[np.ndarray, tuple[float, float, float, float]] | None:
         """返回 (多帧中值深度图 mm, 彩色内参 fx/fy/cx/cy)，无数据时 None。"""
         return None
+
+    def depth_preview_snapshot(
+        self,
+    ) -> tuple[np.ndarray, tuple[float, float, float, float]] | None:
+        """返回实时预览深度；默认复用稳定深度快照。"""
+        return self.depth_snapshot()
 
     def wait_record_frame(self, after_sequence: int, timeout_s: float = 2.0) -> dict:
         """等待一帧可落盘的同步原始 RGB-D；仅直接 SDK 相机支持。"""
@@ -91,9 +97,29 @@ class OrbbecRGBDCamera(CameraBase):
 
     source = "orbbec"
 
-    def __init__(self, serial: str | None = None):
+    def __init__(
+        self,
+        serial: str | None = None,
+        calibration_path: str | Path | None = None,
+    ):
         import pyorbbecsdk as ob
         self._ob = ob
+        self.calibration = (
+            None
+            if calibration_path is None
+            else RGBDCalibration.from_file(calibration_path)
+        )
+        if (
+            serial is not None
+            and self.calibration is not None
+            and self.calibration.serial is not None
+            and serial != self.calibration.serial
+        ):
+            raise ValueError(
+                f"指定相机 {serial} 与 RGB-D 标定 {self.calibration.serial} 不一致"
+            )
+        if serial is None and self.calibration is not None:
+            serial = self.calibration.serial
         self.serial = serial
         self.name = ""
         self.width = 0
@@ -102,6 +128,7 @@ class OrbbecRGBDCamera(CameraBase):
         self._lock = threading.Lock()
         self._record_condition = threading.Condition(self._lock)
         self._color_bgr = None
+        self._aligned_depth_mm = None
         self._depth_hist: deque[np.ndarray] = deque(maxlen=DEPTH_HISTORY)
         self._record_sequence = -1
         self._record_frame: dict | None = None
@@ -114,6 +141,18 @@ class OrbbecRGBDCamera(CameraBase):
 
     # ---- 生命周期 ----
 
+    @staticmethod
+    def _usb_serial_from_uid(uid: str) -> str:
+        """Gemini 335 的 SDK USB 列表不返回序列号，用 UID 映射 sysfs。"""
+        if "-" not in uid:
+            return ""
+        topology = uid.rsplit("-", 1)[0]
+        serial_path = Path("/sys/bus/usb/devices") / topology / "serial"
+        try:
+            return serial_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+
     def start(self) -> None:
         ob = self._ob
         ctx = ob.Context()
@@ -124,30 +163,77 @@ class OrbbecRGBDCamera(CameraBase):
         devices = ctx.query_devices()
         if devices.get_count() == 0:
             raise RuntimeError("SDK 未找到任何 Orbbec 设备")
-        device = None
-        serials = []
+        entries = []
         for i in range(devices.get_count()):
-            d = devices.get_device_by_index(i)
-            sn = d.get_device_info().get_serial_number()
-            serials.append(sn)
-            if self.serial is None or sn == self.serial:
-                device = d
-                self.serial = sn
-                break
+            try:
+                uid = str(devices.get_device_uid_by_index(i))
+            except Exception:
+                uid = ""
+            try:
+                sdk_serial = str(devices.get_device_serial_number_by_index(i))
+            except Exception:
+                sdk_serial = ""
+            serial = sdk_serial or self._usb_serial_from_uid(uid)
+            entries.append({"index": i, "uid": uid, "serial": serial})
+        discovered = [
+            f"{entry['serial'] or '?'}@{entry['uid'] or entry['index']}"
+            for entry in entries
+        ]
+        device = None
+        open_errors = []
+        if self.serial is not None:
+            target = next(
+                (entry for entry in entries if entry["serial"] == self.serial),
+                None,
+            )
+            if target is None:
+                raise RuntimeError(
+                    f"序列号 {self.serial} 不在 Orbbec 设备列表中（已发现: {discovered}）"
+                )
+            try:
+                # 直接按 USB UID 打开目标设备，不触碰被 ROS/Docker 占用的其他相机。
+                device = devices.get_device_by_uid(target["uid"])
+            except Exception as exc:
+                raise RuntimeError(
+                    f"无法打开 Orbbec {self.serial}（USB UID {target['uid']}）。"
+                    "请确认目标相机本身未被占用且当前用户有 USB 写权限"
+                ) from exc
+        else:
+            for entry in entries:
+                try:
+                    device = devices.get_device_by_uid(entry["uid"])
+                    self.serial = (
+                        entry["serial"]
+                        or device.get_device_info().get_serial_number()
+                    )
+                    break
+                except Exception as exc:
+                    open_errors.append(f"{entry['uid']}: {exc}")
         if device is None:
-            raise RuntimeError(f"序列号 {self.serial} 不在设备列表中（已发现: {serials}）")
+            raise RuntimeError(
+                f"没有可打开的 Orbbec（已发现: {discovered}；失败: {open_errors}）"
+            )
         self.name = device.get_device_info().get_name()
 
         self._pipeline = ob.Pipeline(device)
         config = ob.Config()
         color_profiles = self._pipeline.get_stream_profile_list(ob.OBSensorType.COLOR_SENSOR)
-        color_profile = self._pick_best_color_profile(ob, color_profiles)
+        color_profile = self._pick_best_color_profile(
+            ob,
+            color_profiles,
+            expected_shape=(
+                None if self.calibration is None else self.calibration.color_shape
+            ),
+        )
         config.enable_stream(color_profile)
         depth_profiles = self._pipeline.get_stream_profile_list(ob.OBSensorType.DEPTH_SENSOR)
-        try:
-            depth_profile = depth_profiles.get_video_stream_profile(0, 0, ob.OBFormat.Y16, 0)
-        except Exception:
-            depth_profile = depth_profiles.get_default_video_stream_profile()
+        depth_profile = self._pick_depth_profile(
+            ob,
+            depth_profiles,
+            expected_shape=(
+                None if self.calibration is None else self.calibration.depth_shape
+            ),
+        )
         config.enable_stream(depth_profile)
         config.set_frame_aggregate_output_mode(ob.OBFrameAggregateOutputMode.FULL_FRAME_REQUIRE)
         self._pipeline.enable_frame_sync()
@@ -191,7 +277,7 @@ class OrbbecRGBDCamera(CameraBase):
         return False
 
     @staticmethod
-    def _pick_best_color_profile(ob, profiles):
+    def _pick_best_color_profile(ob, profiles, expected_shape=None):
         """遍历所有可解码的彩色档位，按 (像素数, 格式优先级, 帧率) 选最优。
 
         高分辨率彩色通常只有 MJPG 压缩格式（裸 RGB 受 USB 带宽限制），
@@ -212,6 +298,11 @@ class OrbbecRGBDCamera(CameraBase):
                 fmt = vp.get_format()
                 fps = vp.get_fps()
                 available.append(f"{vp.get_width()}x{vp.get_height()}@{fps} {fmt}")
+                if (
+                    expected_shape is not None
+                    and (vp.get_height(), vp.get_width()) != tuple(expected_shape)
+                ):
+                    continue
                 if fmt not in fmt_pref or fps > 30:
                     continue
                 key = (vp.get_width() * vp.get_height(), fmt_pref[fmt], fps)
@@ -231,6 +322,49 @@ class OrbbecRGBDCamera(CameraBase):
             return profiles.get_video_stream_profile(0, 0, ob.OBFormat.RGB, 0)
         except Exception:
             return profiles.get_default_video_stream_profile()
+
+    @staticmethod
+    def _pick_depth_profile(ob, profiles, expected_shape=None):
+        """按生产标定尺寸选择原始 Y16 深度，禁止静默回退到错误分辨率。"""
+        best = None
+        best_fps = -1
+        available = []
+        try:
+            for i in range(profiles.get_count()):
+                profile = profiles.get_stream_profile_by_index(i)
+                try:
+                    video = profile.as_video_stream_profile()
+                except Exception:
+                    continue
+                fmt = video.get_format()
+                fps = video.get_fps()
+                shape = (video.get_height(), video.get_width())
+                available.append(
+                    f"{video.get_width()}x{video.get_height()}@{fps} {fmt}"
+                )
+                if fmt != ob.OBFormat.Y16 or fps > 30:
+                    continue
+                if expected_shape is not None and shape != tuple(expected_shape):
+                    continue
+                if fps > best_fps:
+                    best = video
+                    best_fps = fps
+        except Exception as exc:
+            raise RuntimeError(f"枚举 Orbbec 深度档位失败: {exc}") from exc
+        if best is None:
+            expected = (
+                "任意 Y16"
+                if expected_shape is None
+                else f"{expected_shape[1]}x{expected_shape[0]} Y16"
+            )
+            raise RuntimeError(
+                f"找不到标定要求的深度档位 {expected}；可用档位: {available}"
+            )
+        print(
+            f"[camera] 选用深度: {best.get_width()}x{best.get_height()}"
+            f"@{best.get_fps()} {best.get_format()}"
+        )
+        return best
 
     def stop(self) -> None:
         self._stop_evt.set()
@@ -277,6 +411,7 @@ class OrbbecRGBDCamera(CameraBase):
                 with self._record_condition:
                     self._record_sequence += 1
                     self._color_bgr = bgr
+                    self._aligned_depth_mm = depth_mm
                     self._depth_hist.append(depth_mm)
                     self.raw_depth_width = raw_dw
                     self.raw_depth_height = raw_dh
@@ -393,6 +528,17 @@ class OrbbecRGBDCamera(CameraBase):
         depth = np.median(np.stack(hist), axis=0).astype(np.float32)
         return depth, self.intrinsics
 
+    def depth_preview_snapshot(self):
+        if self.intrinsics is None:
+            return None
+        with self._lock:
+            depth = (
+                None
+                if self._aligned_depth_mm is None
+                else self._aligned_depth_mm.copy()
+            )
+        return None if depth is None else (depth, self.intrinsics)
+
     def info(self) -> dict:
         fx, fy, cx, cy = self.intrinsics or (0, 0, 0, 0)
         return {
@@ -434,5 +580,8 @@ def make_camera(
             startup_timeout_s=startup_timeout_s,
         )
     if source == "orbbec":
-        return OrbbecRGBDCamera(serial=serial)
+        return OrbbecRGBDCamera(
+            serial=serial,
+            calibration_path=calibration_path,
+        )
     raise ValueError(f"未知 camera source: {source!r}（可选 zmq/orbbec/mock）")

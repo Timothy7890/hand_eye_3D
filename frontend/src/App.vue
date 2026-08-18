@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import MarkerOverlay from './components/MarkerOverlay.vue'
 
 const status = ref(null)
@@ -37,22 +37,26 @@ const addMarkerColorId = ref('')
 const markerConfirmation = ref(null)
 const markerBatchSaved = ref(false)
 const imageNaturalSize = ref(null)
+const liveFrameVersion = ref(Date.now())
 let markerKeyCounter = 0
 let detectionRequestId = 0
+let liveFrameTimer = null
 
 const offlineMode = computed(() => status.value?.mode === 'offline')
 const selectedEpisodeInfo = computed(() =>
   offlineEpisodes.value.find((episode) => episode.name === selectedEpisode.value) || null,
 )
 const imageSrc = computed(() => {
-  // status 还没回来时绝不能去拉 /api/stream，否则离线页会误开 MJPEG 把 Vite 代理堵死。
+  // status 还没回来时绝不能拉实时帧，否则离线页会短暂请求错误的数据源。
   if (!status.value) return ''
-  if (!offlineMode.value) return '/api/stream'
+  if (!offlineMode.value) return `/api/frame.jpg?v=${liveFrameVersion.value}`
   if (!selectedEpisode.value) return ''
   return `/api/offline/episodes/${encodeURIComponent(selectedEpisode.value)}/preview?v=${previewVersion.value}`
 })
 const depthOverlaySrc = computed(() => {
-  if (!offlineMode.value || !selectedEpisode.value) return ''
+  if (!status.value) return ''
+  if (!offlineMode.value) return `/api/depth-overlay.png?v=${liveFrameVersion.value}`
+  if (!selectedEpisode.value) return ''
   return `/api/offline/episodes/${encodeURIComponent(selectedEpisode.value)}/depth-overlay?v=${previewVersion.value}`
 })
 const overlayImageSize = computed(() => markerImageSize.value || imageNaturalSize.value)
@@ -446,8 +450,25 @@ async function saveMarkerBatch() {
 
 function onImageLoad(event) {
   const image = event.currentTarget
+  if (errorMsg.value === '预览图加载失败，正在重试…') errorMsg.value = ''
   if (image.naturalWidth && image.naturalHeight) {
     imageNaturalSize.value = [image.naturalWidth, image.naturalHeight]
+  }
+  if (!offlineMode.value) {
+    clearTimeout(liveFrameTimer)
+    liveFrameTimer = setTimeout(() => {
+      liveFrameVersion.value = Date.now()
+    }, 160)
+  }
+}
+
+function onImageError() {
+  errorMsg.value = '预览图加载失败，正在重试…'
+  if (!offlineMode.value) {
+    clearTimeout(liveFrameTimer)
+    liveFrameTimer = setTimeout(() => {
+      liveFrameVersion.value = Date.now()
+    }, 500)
   }
 }
 
@@ -828,6 +849,10 @@ onMounted(async () => {
     if (!offlineMode.value) refreshArm()
   }, 800)
 })
+
+onBeforeUnmount(() => {
+  clearTimeout(liveFrameTimer)
+})
 </script>
 
 <template>
@@ -898,10 +923,10 @@ onMounted(async () => {
         <div v-else-if="!episodesBusy" class="coord dim">没有可用的离线剧集</div>
       </div>
 
-      <div v-if="offlineMode" class="depth-controls">
+      <div v-if="status" class="depth-controls">
         <label class="depth-toggle">
           <input v-model="showDepthOverlay" type="checkbox" />
-          叠加五帧中值深度
+          {{ offlineMode ? '叠加五帧中值深度' : '叠加实时 SDK 对齐深度' }}
         </label>
         <input
           v-model.number="depthOverlayOpacity"
@@ -926,7 +951,7 @@ onMounted(async () => {
           :height="overlayImageSize?.[1] || undefined"
           :alt="offlineMode ? `${selectedEpisode} 代表帧` : '实时相机画面'"
           @load="onImageLoad"
-          @error="errorMsg = '预览图加载失败，请强制刷新页面'"
+          @error="onImageError"
           @click="onVideoClick"
         />
         <img
@@ -934,7 +959,7 @@ onMounted(async () => {
           class="depth-overlay"
           :src="depthOverlaySrc"
           :style="{ opacity: depthOverlayOpacity / 100 }"
-          alt="五帧中值深度伪彩叠加"
+          :alt="offlineMode ? '五帧中值深度伪彩叠加' : '实时 SDK 对齐深度伪彩叠加'"
           @error="errorMsg = '深度叠加加载失败，请检查后端是否已重启'"
         />
         <MarkerOverlay

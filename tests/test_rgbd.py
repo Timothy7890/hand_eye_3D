@@ -281,5 +281,79 @@ runpy.run_path({str(script)!r}, run_name="__main__")
         self.assertIn("Orbbec SDK", result.stdout)
 
 
+class LiveDepthOverlayTest(unittest.TestCase):
+    def test_encodes_valid_depth_with_transparent_invalid_pixels(self):
+        from backend.app import _encode_live_depth_overlay
+
+        depth = np.array(
+            [[0.0, 300.0, 1000.0], [2000.0, 2001.0, np.nan]],
+            dtype=np.float32,
+        )
+        encoded = _encode_live_depth_overlay(depth)
+        overlay = cv2.imdecode(
+            np.frombuffer(encoded, dtype=np.uint8), cv2.IMREAD_UNCHANGED
+        )
+        self.assertEqual(overlay.shape, (2, 3, 4))
+        np.testing.assert_array_equal(
+            overlay[..., 3],
+            np.array([[0, 255, 255], [255, 0, 0]], dtype=np.uint8),
+        )
+
+
+class OrbbecProfileSelectionTest(unittest.TestCase):
+    def test_selects_calibration_depth_shape_instead_of_default(self):
+        from backend.camera import OrbbecRGBDCamera
+
+        class Format:
+            Y16 = "Y16"
+
+        class FakeOb:
+            OBFormat = Format
+
+        class Profile:
+            def __init__(self, width, height, fps, fmt="Y16"):
+                self.width, self.height, self.fps, self.fmt = width, height, fps, fmt
+
+            def as_video_stream_profile(self):
+                return self
+
+            def get_width(self):
+                return self.width
+
+            def get_height(self):
+                return self.height
+
+            def get_fps(self):
+                return self.fps
+
+            def get_format(self):
+                return self.fmt
+
+        class Profiles:
+            def __init__(self, items):
+                self.items = items
+
+            def get_count(self):
+                return len(self.items)
+
+            def get_stream_profile_by_index(self, index):
+                return self.items[index]
+
+        profiles = Profiles(
+            [
+                Profile(848, 480, 30),
+                Profile(1280, 800, 15),
+                Profile(1280, 800, 30),
+            ]
+        )
+        selected = OrbbecRGBDCamera._pick_depth_profile(
+            FakeOb, profiles, expected_shape=(800, 1280)
+        )
+        self.assertEqual(
+            (selected.get_width(), selected.get_height(), selected.get_fps()),
+            (1280, 800, 30),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

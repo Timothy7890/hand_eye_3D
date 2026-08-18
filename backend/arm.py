@@ -62,6 +62,21 @@ def _load_arm_model(arm: str):
     return model, f"{arm}_arm"
 
 
+def _make_crc(crc_class):
+    """优先用 SDK 原生 CRC；pip 漏装 .so 时使用 SDK 自带的 Python 实现。"""
+    try:
+        return crc_class()
+    except OSError as exc:
+        if "crc_amd64.so" not in str(exc) and "crc_aarch64.so" not in str(exc):
+            raise
+        # CRC.__init__ 在加载动态库前已经建立所有消息 pack format；
+        # Singleton 会返回同一个半初始化实例。非 Linux 分支本来就调用 _crc_py。
+        fallback = crc_class.__new__(crc_class)
+        fallback.platform = "Python"
+        print(f"[arm] Unitree CRC 动态库缺失，使用 SDK 纯 Python CRC: {exc}")
+        return fallback
+
+
 class H2ArmController:
     """位置保持 + 限速点动 + 卸力拖动，发布 rt/arm_sdk（真机运动）。"""
 
@@ -109,7 +124,7 @@ class H2ArmController:
                                else H2_RIGHT_ARM_MOTOR_INDICES)
 
         ensure_dds_initialized(network_interface)
-        self._crc = CRC()
+        self._crc = _make_crc(CRC)
         self._low_cmd = unitree_hg_msg_dds__LowCmd_()
         self._publisher = ChannelPublisher(ARM_SDK_TOPIC, LowCmd_)
         self._publisher.Init()
