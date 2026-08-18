@@ -1,3 +1,4 @@
+import { fileURLToPath, URL } from 'node:url'
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 
@@ -5,6 +6,7 @@ import vue from '@vitejs/plugin-vue'
 const BACKEND = 'http://localhost:8132'
 
 export default defineConfig({
+  cacheDir: fileURLToPath(new URL('./node_modules/.vite-image', import.meta.url)),
   plugins: [vue()],
   server: {
     host: '0.0.0.0',

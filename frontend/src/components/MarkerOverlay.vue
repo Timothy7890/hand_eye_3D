@@ -1,5 +1,5 @@
 <script setup>
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 
 const props = defineProps({
   imageSize: {
@@ -87,6 +87,68 @@ function isSaved(marker) {
   return marker.source === 'saved' || markerFlags(marker).includes('already_saved')
 }
 
+const labelLayouts = computed(() => {
+  const width = Number(props.imageSize?.[0]) || 1
+  const height = Number(props.imageSize?.[1]) || 1
+  const labelWidth = 86
+  const labelHeight = 23
+  const labelGap = 8
+  const margin = 10
+  const markers = props.markers.map((marker) => ({
+    marker,
+    x: Number(marker.center?.[0]) || 0,
+    y: Number(marker.center?.[1]) || 0,
+  }))
+  if (!markers.length) return {}
+
+  const averageX = markers.reduce((sum, item) => sum + item.x, 0) / markers.length
+  const placeRight = averageX < width / 2
+  const outerX = placeRight
+    ? Math.max(...markers.map((item) => item.x))
+    : Math.min(...markers.map((item) => item.x))
+  const labelX = placeRight
+    ? Math.min(width - labelWidth - margin, outerX + 65)
+    : Math.max(margin, outerX - labelWidth - 65)
+  const sorted = [...markers].sort((a, b) => a.y - b.y)
+
+  let previousBottom = margin - labelGap
+  const positioned = sorted.map((item) => {
+    const y = Math.max(margin, item.y - labelHeight / 2, previousBottom + labelGap)
+    previousBottom = y + labelHeight
+    return { ...item, labelX, labelY: y }
+  })
+  const overflow = Math.max(0, previousBottom - (height - margin))
+
+  return Object.fromEntries(positioned.map((item) => {
+    const labelY = Math.max(margin, item.labelY - overflow)
+    const lineX = placeRight ? labelX : labelX + labelWidth
+    const lineY = labelY + labelHeight / 2
+    const dx = item.x - lineX
+    const dy = item.y - lineY
+    const distance = Math.max(1, Math.hypot(dx, dy))
+    const radius = Math.max(Number(item.marker.radius_px) || 12, 8) + 6
+    return [item.marker._key, {
+      x: labelX,
+      y: labelY,
+      lineX,
+      lineY,
+      markerX: item.x - (dx / distance) * radius,
+      markerY: item.y - (dy / distance) * radius,
+    }]
+  }))
+})
+
+function labelLayout(marker) {
+  return labelLayouts.value[marker._key] || {
+    x: marker.center[0] + 65,
+    y: marker.center[1] - 12,
+    lineX: marker.center[0] + 65,
+    lineY: marker.center[1],
+    markerX: marker.center[0],
+    markerY: marker.center[1],
+  }
+}
+
 function onCanvasPointerDown(event) {
   if (props.disabled) return
   const point = pointFromEvent(event)
@@ -127,6 +189,19 @@ function endDrag(event) {
     @pointerup="endDrag"
     @pointercancel="endDrag"
   >
+    <defs>
+      <marker
+        id="leader-arrow"
+        viewBox="0 0 6 6"
+        refX="5"
+        refY="3"
+        markerWidth="5"
+        markerHeight="5"
+        orient="auto"
+      >
+        <path d="M 0 0 L 6 3 L 0 6 z" />
+      </marker>
+    </defs>
     <rect
       class="overlay-hit-area"
       x="0"
@@ -151,6 +226,14 @@ function endDrag(event) {
         · 置信度 {{ Math.round(Number(marker.confidence ?? 0) * 100) }}%
         {{ markerFlags(marker).length ? `· ${markerFlags(marker).join(', ')}` : '' }}
       </title>
+      <line
+        class="marker-leader"
+        :x1="labelLayout(marker).lineX"
+        :y1="labelLayout(marker).lineY"
+        :x2="labelLayout(marker).markerX"
+        :y2="labelLayout(marker).markerY"
+        marker-end="url(#leader-arrow)"
+      />
       <circle
         class="marker-halo"
         :cx="marker.center[0]"
@@ -178,11 +261,11 @@ function endDrag(event) {
         :y1="marker.center[1] - 5"
         :y2="marker.center[1] + 5"
       />
-      <g :transform="`translate(${marker.center[0] + 10} ${marker.center[1] - 25})`">
-        <rect class="marker-label-bg" x="0" y="0" width="78" height="21" rx="5" />
-        <circle cx="10" cy="10.5" r="5" :fill="markerColor(marker)" />
-        <text class="marker-label" x="19" y="14">{{ markerLabel(marker) }}{{ isSaved(marker) ? '✓' : '' }}</text>
-        <text v-if="isUncertain(marker)" class="marker-warning" x="66" y="14">!</text>
+      <g :transform="`translate(${labelLayout(marker).x} ${labelLayout(marker).y})`">
+        <rect class="marker-label-bg" x="0" y="0" width="86" height="23" rx="5" />
+        <circle cx="11" cy="11.5" r="5" :fill="markerColor(marker)" />
+        <text class="marker-label" x="20" y="15">{{ markerLabel(marker) }}{{ isSaved(marker) ? '✓' : '' }}</text>
+        <text v-if="isUncertain(marker)" class="marker-warning" x="73" y="15">!</text>
       </g>
     </g>
   </svg>
@@ -258,6 +341,17 @@ function endDrag(event) {
   stroke: white;
   stroke-width: 2;
   pointer-events: none;
+}
+
+.marker-leader {
+  stroke: rgba(255, 255, 255, .82);
+  stroke-width: 1;
+  fill: none;
+  pointer-events: none;
+}
+
+#leader-arrow path {
+  fill: rgba(255, 255, 255, .82);
 }
 
 .marker-label-bg {

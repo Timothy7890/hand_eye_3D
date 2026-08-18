@@ -6,6 +6,7 @@ const BACKEND = 'http://localhost:8132'
 
 export default defineConfig({
   root: fileURLToPath(new URL('./pointcloud', import.meta.url)),
+  cacheDir: fileURLToPath(new URL('./node_modules/.vite-pointcloud', import.meta.url)),
   plugins: [vue()],
   server: {
     host: '0.0.0.0',

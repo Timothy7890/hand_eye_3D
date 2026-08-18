@@ -87,6 +87,9 @@ function initViewer() {
   scene.background = new THREE.Color(0x080c14)
 
   camera = new THREE.PerspectiveCamera(48, 1, 0.005, 50)
+  // 相机坐标系为 X 右、Y 下、Z 前。Three.js 相机默认看向 -Z，
+  // 当观察方向改为 +Z 时需同时把 up 设为 -Y，才能保持画面不镜像。
+  camera.up.set(0, -1, 0)
   camera.position.set(0, 0, -2)
 
   renderer = new THREE.WebGLRenderer({ antialias: true })
@@ -137,7 +140,7 @@ function frameCloud(geometry) {
   geometry.computeBoundingSphere()
   const sphere = geometry.boundingSphere
   if (!sphere) return
-  const center = new THREE.Vector3(sphere.center.x, -sphere.center.y, sphere.center.z)
+  const center = sphere.center.clone()
   const radius = Math.max(sphere.radius, 0.12)
   controls.target.copy(center)
   camera.position.set(center.x, center.y, center.z - radius * 2.8)
@@ -185,7 +188,6 @@ async function loadPointCloud() {
       sizeAttenuation: true,
     })
     cloudObject = new THREE.Points(geometry, cloudMaterial)
-    cloudObject.scale.set(1, -1, 1)
     scene.add(cloudObject)
     cloudId.value = id || ''
     pointCount.value = Number.isFinite(count) ? count : geometry.getAttribute('position').count
@@ -275,7 +277,7 @@ function refreshHighlights() {
     )
     const displayPoint = selection.displayPoint || [
       selection.point[0],
-      -selection.point[1],
+      selection.point[1],
       selection.point[2],
     ]
     mesh.position.fromArray(displayPoint)
