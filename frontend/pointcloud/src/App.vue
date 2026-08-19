@@ -47,7 +47,10 @@ const savedColors = computed(() => new Set(episodeSamples.value.map((sample) => 
 const selectedColors = computed(() => new Set(selections.value.map((item) => item.color)))
 const selectableColors = computed(() => markerColors.value)
 const canSave = computed(() =>
-  selections.value.length > 0 && !cloudBusy.value && !saveBusy.value && Boolean(cloudId.value),
+  (selections.value.length > 0 || episodeSamples.value.length > 0)
+  && !cloudBusy.value
+  && !saveBusy.value
+  && Boolean(selectedEpisode.value),
 )
 const residualSummary = computed(() => {
   const residual = solveResult.value?.residual_mm
@@ -417,6 +420,21 @@ async function confirmAndSave() {
   errorMsg.value = ''
   infoMsg.value = ''
   try {
+    if (!selections.value.length) {
+      const deleteResponse = await fetch(
+        `/api/samples/by-episode/${encodeURIComponent(selectedEpisode.value)}`,
+        { method: 'DELETE' },
+      )
+      if (!deleteResponse.ok) {
+        throw await responseError(deleteResponse, '清空已保存观测失败')
+      }
+      const deleted = await deleteResponse.json()
+      await loadWorkspace()
+      activeColor.value = selectableColors.value[0]?.color || ''
+      infoMsg.value = `已清空 ${selectedEpisode.value} 的 ${deleted.deleted_count || 0} 个观测`
+      return
+    }
+
     const confirmResponse = await fetch('/api/offline/confirm-points', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -636,7 +654,13 @@ onBeforeUnmount(() => {
             </p>
           </div>
           <button class="primary-button" :disabled="!canSave" @click="confirmAndSave">
-            {{ saveBusy ? '确认并保存中…' : '确认并保存本姿态' }}
+            {{
+              saveBusy
+                ? '确认并保存中…'
+                : (!selections.length && episodeSamples.length
+                  ? '保存清空结果'
+                  : '确认并保存本姿态')
+            }}
           </button>
         </section>
 

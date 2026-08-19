@@ -1151,6 +1151,29 @@ async def api_delete_sample(index: int):
     return {"ok": True, "count": len(_load_samples())}
 
 
+@app.delete("/api/samples/by-episode/{episode}")
+async def api_delete_samples_by_episode(episode: str):
+    episode = episode.strip()
+    if not episode:
+        return JSONResponse({"ok": False, "error": "episode 不能为空"}, status_code=400)
+    with samples_lock:
+        matched = [
+            sample
+            for sample in _load_samples()
+            if _sample_schema_version(sample) == 2
+            and _imported_episode(sample) == episode
+        ]
+        for sample in matched:
+            (_samples_dir() / f"{int(sample['index']):04d}.json").unlink(missing_ok=True)
+        remaining = len(_load_samples())
+    return {
+        "ok": True,
+        "episode": episode,
+        "deleted_count": len(matched),
+        "count": remaining,
+    }
+
+
 def _find_latest_calib() -> Path | None:
     """找最新一份手眼标定结果：先看本会话目录，再翻数据根目录下各时间戳会话。"""
     candidates = [save_path / "handeye3d_result.json"]
