@@ -1,0 +1,126 @@
+{
+  "schema_version": 2,
+  "id": "marker-red",
+  "marker_id": "marker-red",
+  "color": "red",
+  "episode": "episode_0002",
+  "pose_id": "episode_0002",
+  "source": "point_cloud",
+  "vertex_index": 413522,
+  "cloud_id": "1e69e48593b7a1f29b02accf",
+  "point_cloud_stride": 1,
+  "pixel": [
+    1328,
+    571
+  ],
+  "center": [
+    1328,
+    571
+  ],
+  "p_camera": [
+    0.18798276782035828,
+    0.01712759956717491,
+    0.5266382098197937
+  ],
+  "T_base_wrist": [
+    [
+      0.4800773986636562,
+      0.6546503097303614,
+      0.5839166578051007,
+      0.3747257645936375
+    ],
+    [
+      -0.22557471333325174,
+      -0.5511289574844199,
+      0.8033510570894634,
+      -0.2299255606837143
+    ],
+    [
+      0.8477273972197422,
+      -0.5173875183961039,
+      -0.11691200028638239,
+      0.42197241278732994
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "depth_mm": 526.6382098197937,
+  "valid_ratio": 1,
+  "valid_depth_frames": 5,
+  "depth_frame_count": 5,
+  "burst_frames_used": 5,
+  "depth_spread_mm": 1.00115966796875,
+  "right_arm_q_median": [
+    -0.9470627903938293,
+    -0.5095692873001099,
+    0.12050138413906097,
+    0.07708253711462021,
+    -1.774456262588501,
+    0.571060299873352,
+    0.10090717673301697
+  ],
+  "qpos_median_rad": [
+    -0.9470627903938293,
+    -0.5095692873001099,
+    0.12050138413906097,
+    0.07708253711462021,
+    -1.774456262588501,
+    0.571060299873352,
+    0.10090717673301697
+  ],
+  "base_link": "torso_link",
+  "wrist_link": "right_wrist_yaw_link",
+  "camera_serial": "CP0BB53000FS",
+  "provenance": {
+    "mode": "offline_point_cloud",
+    "episode": "episode_0002",
+    "task_dir": "/home/robot/yx/project/calib/hand_eye_3D/teleop_data/biaoding",
+    "data_json": "/home/robot/yx/project/calib/hand_eye_3D/teleop_data/biaoding/episode_0002/data.json",
+    "rgbd_calibration": "/home/robot/yx/project/calib/hand_eye_3D/config/camera/orbbec_rgbd_calibration.json",
+    "camera_serial": "CP0BB53000FS",
+    "frame_indices": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "representative_frame": 2,
+    "representative_rgb": "/home/robot/yx/project/calib/hand_eye_3D/teleop_data/biaoding/episode_0002/rgb/000002_head_rgb.jpg",
+    "timestamps": {
+      "sample_timestamp_ns": 1787040916031989200,
+      "joint_read_timestamp_ns": 1787040916044542700
+    },
+    "cloud_id": "1e69e48593b7a1f29b02accf",
+    "point_cloud_stride": 1,
+    "vertex_index": 413522,
+    "pixel": [
+      1328,
+      571
+    ],
+    "burst_frames_used": 5,
+    "valid_depth_frames": 5,
+    "depth_mm": 526.6382098197937,
+    "depth_spread_mm": 1.00115966796875,
+    "qpos_median_rad": [
+      -0.9470627903938293,
+      -0.5095692873001099,
+      0.12050138413906097,
+      0.07708253711462021,
+      -1.774456262588501,
+      0.571060299873352,
+      0.10090717673301697
+    ]
+  },
+  "index": 10,
+  "datetime": "2026-08-18T16:32:26",
+  "pose_source": "offline_teleop_episode",
+  "camera": {
+    "serial": "CP0BB53000FS",
+    "source": "offline_teleop_episode"
+  }
+}
