@@ -160,6 +160,12 @@ class H2ArmController:
             other_grav = ArmGravityModel(model, other_chain, payload_kg=self.payload_kg)
             self._other_tau = np.clip(self.grav_alpha * other_grav.torque(self._other_hold_q),
                                       -self._tau_cap, self._tau_cap)
+        # Command-space handoffs must start from what was actually published,
+        # not from measured joints or an upstream target that may have been limited.
+        self._last_sent_q = q0.copy()
+        self._last_sent_tau_ff = np.zeros(self.n)
+        self._last_sent_at = None
+        self._last_sent_sequence = 0
         self._thread = threading.Thread(target=self._loop, name="h2-arm-jog", daemon=True)
 
     # ---- DDS 读 ----
@@ -175,8 +181,46 @@ class H2ArmController:
             raise RuntimeError("还没收到 rt/lowstate")
         return np.asarray([state.motor_state[i].q for i in indices], dtype=float)
 
+    def _read_motor_feedback(self, indices) -> dict:
+        """Read one coherent lowstate frame for gravity-identification logging.
+
+        Unitree exposes joint torque as ``tau_est`` (an estimate, not a
+        calibrated force/torque sensor), so keep that distinction in the key.
+        Older SDK message variants may omit dq/tau_est; return None for those
+        fields instead of failing position diagnostics.
+        """
+        with self._state_lock:
+            state = self._low_state
+        if state is None:
+            raise RuntimeError("还没收到 rt/lowstate")
+        motors = [state.motor_state[i] for i in indices]
+
+        def values(field: str) -> list[float] | None:
+            if not all(hasattr(motor, field) for motor in motors):
+                return None
+            result = [float(getattr(motor, field)) for motor in motors]
+            return result if np.all(np.isfinite(result)) else None
+
+        return {
+            "q_rad": values("q"),
+            "dq_rad_s": values("dq"),
+            "tau_est_nm": values("tau_est"),
+        }
+
     def read_measured(self) -> np.ndarray:
         return self._read_motors(self._jog_indices)
+
+    def command_snapshot(self) -> dict:
+        """Return the latest command successfully handed to the DDS publisher."""
+        with self._lock:
+            if self._last_sent_at is None or self._last_sent_sequence <= 0:
+                raise RuntimeError("arm controller has not published a command yet")
+            return {
+                "q_rad": self._last_sent_q.copy(),
+                "tau_ff_nm": self._last_sent_tau_ff.copy(),
+                "sent_at_monotonic": float(self._last_sent_at),
+                "sequence": int(self._last_sent_sequence),
+            }
 
     def read_torso_state(self) -> dict | None:
         """腰三关节 + IMU 姿态，用于"手臂到位了但躯干动了吗"的诊断。"""
@@ -235,6 +279,12 @@ class H2ArmController:
             m.kd = float(self.kd_vec[i])
         cmd.crc = self._crc.Crc(cmd)
         self._publisher.Write(cmd)
+        sent_at = time.monotonic()
+        with self._lock:
+            self._last_sent_q = jog_q.copy()
+            self._last_sent_tau_ff = tau_ff.copy()
+            self._last_sent_at = sent_at
+            self._last_sent_sequence += 1
 
     def _compute_tau(self, cmd_q: np.ndarray, tau_push: np.ndarray,
                      float_mode: bool, weight: float) -> np.ndarray:
@@ -418,10 +468,14 @@ class H2ArmController:
             floating = self._float
             weight = self._weight
             push = self._tau_push.copy()
+            last_sent_q = self._last_sent_q.copy()
+            last_sent_tau = self._last_sent_tau_ff.copy()
+            last_sent_at = self._last_sent_at
+            last_sent_sequence = self._last_sent_sequence
         try:
-            measured = self.read_measured().tolist()
+            feedback = self._read_motor_feedback(self._jog_indices)
         except Exception:
-            measured = None
+            feedback = {"q_rad": None, "dq_rad_s": None, "tau_est_nm": None}
         return {
             "arm": self.arm,
             "engaged": self._engaged,
@@ -429,7 +483,9 @@ class H2ArmController:
             "float": floating,
             "weight": weight,
             "joint_names": self.joint_names,
-            "measured_rad": measured,
+            "measured_rad": feedback["q_rad"],
+            "measured_dq_rad_s": feedback["dq_rad_s"],
+            "tau_est_nm": feedback["tau_est_nm"],
             "cmd_rad": cmd.tolist(),
             "desired_rad": desired.tolist(),
             "limits_rad": self.limits.tolist(),
@@ -444,4 +500,8 @@ class H2ArmController:
             "use_imu_gravity": self.use_imu_gravity,
             "tau_grav_nm": np.asarray(self._tau_grav).tolist(),
             "tau_push_nm": push.tolist(),
+            "last_sent_rad": last_sent_q.tolist(),
+            "last_sent_tau_ff_nm": last_sent_tau.tolist(),
+            "last_sent_at_monotonic": last_sent_at,
+            "last_sent_sequence": last_sent_sequence,
         }

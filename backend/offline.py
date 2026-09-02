@@ -133,6 +133,10 @@ class OfflineEpisodeBackend:
     def _candidate_paths(self) -> list[Path]:
         return sorted(self.task_dir.glob("episode_*/data.json"))
 
+    def episode_names(self) -> set[str]:
+        """当前磁盘上仍存在 data.json 的 episode 名称。"""
+        return {path.parent.name for path in self._candidate_paths()}
+
     @staticmethod
     def _read_json(path: Path) -> dict[str, Any]:
         try:

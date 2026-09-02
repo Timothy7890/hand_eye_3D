@@ -1,0 +1,90 @@
+[08/18 15:44:20.375820][warning][151255][UsbEnumeratorLibusb.cpp:399] Failed to open USB device: error=Access denied (insufficient permissions). Try again
+[08/18 15:44:20.425986][warning][151255][UsbEnumeratorLibusb.cpp:403] Failed to open USB device (Access denied (insufficient permissions)), skipping, info.serial and infName may be empty
+[08/18 15:44:20.426132][warning][151255][UsbEnumeratorLibusb.cpp:399] Failed to open USB device: error=Access denied (insufficient permissions). Try again
+[08/18 15:44:20.476307][warning][151255][UsbEnumeratorLibusb.cpp:403] Failed to open USB device (Access denied (insufficient permissions)), skipping, info.serial and infName may be empty
+[08/18 15:44:20.476457][warning][151255][UsbEnumeratorLibusb.cpp:399] Failed to open USB device: error=Access denied (insufficient permissions). Try again
+[08/18 15:44:20.526614][warning][151255][UsbEnumeratorLibusb.cpp:403] Failed to open USB device (Access denied (insufficient permissions)), skipping, info.serial and infName may be empty
+[08/18 15:44:20.526793][warning][151255][UsbEnumeratorLibusb.cpp:399] Failed to open USB device: error=Access denied (insufficient permissions). Try again
+[08/18 15:44:20.576916][warning][151255][UsbEnumeratorLibusb.cpp:403] Failed to open USB device (Access denied (insufficient permissions)), skipping, info.serial and infName may be empty
+[08/18 15:44:20.579071][info][151255][LinuxUsbPal.cpp:335] Create PollingDeviceWatcher!
+[08/18 15:44:20.579126][info][151255][DeviceManager.cpp:25] Current found device(s): (4)
+[08/18 15:44:20.579136][info][151255][DeviceManager.cpp:34] 	- Name: Gemini 335, PID: 0x0800, SN/ID: , Connection: USB2.1
+[08/18 15:44:20.579144][info][151255][DeviceManager.cpp:34] 	- Name: Gemini 335, PID: 0x0800, SN/ID: , Connection: USB3.2
+[08/18 15:44:20.579149][info][151255][DeviceManager.cpp:34] 	- Name: Gemini 335, PID: 0x0800, SN/ID: , Connection: USB3.2
+[08/18 15:44:20.579154][info][151255][DeviceManager.cpp:34] 	- Name: Gemini 335, PID: 0x0800, SN/ID: , Connection: USB3.2
+[08/18 15:44:20.579164][info][151255][DeviceManager.cpp:339] Enable net device enumeration: true
+[08/18 15:44:22.589472][info][151255][DeviceManager.cpp:25] Current device(s) list: (4)
+[08/18 15:44:22.589634][info][151255][DeviceManager.cpp:34] 	- Name: Gemini 335, PID: 0x0800, SN/ID: , Connection: USB2.1
+[08/18 15:44:22.589651][info][151255][DeviceManager.cpp:34] 	- Name: Gemini 335, PID: 0x0800, SN/ID: , Connection: USB3.2
+[08/18 15:44:22.589659][info][151255][DeviceManager.cpp:34] 	- Name: Gemini 335, PID: 0x0800, SN/ID: , Connection: USB3.2
+[08/18 15:44:22.589666][info][151255][DeviceManager.cpp:34] 	- Name: Gemini 335, PID: 0x0800, SN/ID: , Connection: USB3.2
+[08/18 15:44:36.979022][warning][151844][UsbEnumeratorLibusb.cpp:399] Failed to open USB device: error=Access denied (insufficient permissions). Try again
+[08/18 15:44:37.029120][warning][151844][UsbEnumeratorLibusb.cpp:403] Failed to open USB device (Access denied (insufficient permissions)), skipping, info.serial and infName may be empty
+[08/18 15:44:37.029169][warning][151844][UsbEnumeratorLibusb.cpp:399] Failed to open USB device: error=Access denied (insufficient permissions). Try again
+[08/18 15:44:37.079321][warning][151844][UsbEnumeratorLibusb.cpp:403] Failed to open USB device (Access denied (insufficient permissions)), skipping, info.serial and infName may be empty
+[08/18 15:44:37.079462][warning][151844][UsbEnumeratorLibusb.cpp:399] Failed to open USB device: error=Access denied (insufficient permissions). Try again
+[08/18 15:44:37.129680][warning][151844][UsbEnumeratorLibusb.cpp:403] Failed to open USB device (Access denied (insufficient permissions)), skipping, info.serial and infName may be empty
+[08/18 15:44:37.129944][warning][151844][UsbEnumeratorLibusb.cpp:399] Failed to open USB device: error=Access denied (insufficient permissions). Try again
+[08/18 15:44:37.180134][warning][151844][UsbEnumeratorLibusb.cpp:403] Failed to open USB device (Access denied (insufficient permissions)), skipping, info.serial and infName may be empty
+[08/18 15:44:37.182866][info][151844][LinuxUsbPal.cpp:335] Create PollingDeviceWatcher!
+[08/18 15:44:37.182979][info][151844][DeviceManager.cpp:25] Current found device(s): (4)
+[08/18 15:44:37.182996][info][151844][DeviceManager.cpp:34] 	- Name: Gemini 335, PID: 0x0800, SN/ID: , Connection: USB2.1
+[08/18 15:44:37.183008][info][151844][DeviceManager.cpp:34] 	- Name: Gemini 335, PID: 0x0800, SN/ID: , Connection: USB3.2
+[08/18 15:44:37.183017][info][151844][DeviceManager.cpp:34] 	- Name: Gemini 335, PID: 0x0800, SN/ID: , Connection: USB3.2
+[08/18 15:44:37.183025][info][151844][DeviceManager.cpp:34] 	- Name: Gemini 335, PID: 0x0800, SN/ID: , Connection: USB3.2
+[08/18 15:44:37.183038][info][151844][DeviceManager.cpp:339] Enable net device enumeration: true
+[08/18 15:44:39.197936][info][151844][DeviceManager.cpp:25] Current device(s) list: (4)
+[08/18 15:44:39.198063][info][151844][DeviceManager.cpp:34] 	- Name: Gemini 335, PID: 0x0800, SN/ID: , Connection: USB2.1
+[08/18 15:44:39.198077][info][151844][DeviceManager.cpp:34] 	- Name: Gemini 335, PID: 0x0800, SN/ID: , Connection: USB3.2
+[08/18 15:44:39.198084][info][151844][DeviceManager.cpp:34] 	- Name: Gemini 335, PID: 0x0800, SN/ID: , Connection: USB3.2
+[08/18 15:44:39.198093][info][151844][DeviceManager.cpp:34] 	- Name: Gemini 335, PID: 0x0800, SN/ID: , Connection: USB3.2
+[08/18 15:44:39.198538][warning][151844][ObException.cpp:8] Open device failed: Access denied (insufficient permissions)
+[08/18 15:44:39.198679][warning][151844][UsbEnumeratorLibusb.cpp:458] Execute failure! A libobsensor_exception has occurred!
+ - where: UsbEnumeratorLibusb.cpp(458):openUsbDevice
+ - msg: Open device failed: Access denied (insufficient permissions)
+ - type: N11libobsensor23invalid_value_exceptionE
+[08/18 15:44:39.198723][warning][151844][ObException.cpp:8] Open device failed: Access denied (insufficient permissions)
+[08/18 15:44:39.198745][warning][151844][UsbEnumeratorLibusb.cpp:458] Execute failure! A libobsensor_exception has occurred!
+ - where: UsbEnumeratorLibusb.cpp(458):openUsbDevice
+ - msg: Open device failed: Access denied (insufficient permissions)
+ - type: N11libobsensor23invalid_value_exceptionE
+[08/18 15:44:39.198754][warning][151844][ObException.hpp:48] usbEnumerator openUsbDevice failed!
+[08/18 15:44:39.198850][warning][151844][DeviceBase.cpp:343] Execute failure! A libobsensor_exception has occurred!
+ - where: DeviceBase.cpp(343):getComponent
+ - msg: usbEnumerator openUsbDevice failed!
+ - type: N11libobsensor29camera_disconnected_exceptionE
+[08/18 15:44:39.199013][warning][151844][ObException.cpp:8] Open device failed: Access denied (insufficient permissions)
+[08/18 15:44:39.199040][warning][151844][UsbEnumeratorLibusb.cpp:458] Execute failure! A libobsensor_exception has occurred!
+ - where: UsbEnumeratorLibusb.cpp(458):openUsbDevice
+ - msg: Open device failed: Access denied (insufficient permissions)
+ - type: N11libobsensor23invalid_value_exceptionE
+[08/18 15:44:39.199068][warning][151844][ObException.cpp:8] Open device failed: Access denied (insufficient permissions)
+[08/18 15:44:39.199092][warning][151844][UsbEnumeratorLibusb.cpp:458] Execute failure! A libobsensor_exception has occurred!
+ - where: UsbEnumeratorLibusb.cpp(458):openUsbDevice
+ - msg: Open device failed: Access denied (insufficient permissions)
+ - type: N11libobsensor23invalid_value_exceptionE
+[08/18 15:44:39.199099][warning][151844][ObException.hpp:48] usbEnumerator openUsbDevice failed!
+[08/18 15:44:39.199149][warning][151844][DeviceBase.cpp:343] Execute failure! A libobsensor_exception has occurred!
+ - where: DeviceBase.cpp(343):getComponent
+ - msg: usbEnumerator openUsbDevice failed!
+ - type: N11libobsensor29camera_disconnected_exceptionE
+[08/18 15:56:49.273206][warning][16162][UsbEnumeratorLibusb.cpp:399] Failed to open USB device: error=Access denied (insufficient permissions). Try again
+[08/18 15:56:49.323352][warning][16162][UsbEnumeratorLibusb.cpp:403] Failed to open USB device (Access denied (insufficient permissions)), skipping, info.serial and infName may be empty
+[08/18 15:56:49.323475][warning][16162][UsbEnumeratorLibusb.cpp:399] Failed to open USB device: error=Access denied (insufficient permissions). Try again
+[08/18 15:56:49.373651][warning][16162][UsbEnumeratorLibusb.cpp:403] Failed to open USB device (Access denied (insufficient permissions)), skipping, info.serial and infName may be empty
+[08/18 15:56:49.373775][warning][16162][UsbEnumeratorLibusb.cpp:399] Failed to open USB device: error=Access denied (insufficient permissions). Try again
+[08/18 15:56:49.423905][warning][16162][UsbEnumeratorLibusb.cpp:403] Failed to open USB device (Access denied (insufficient permissions)), skipping, info.serial and infName may be empty
+[08/18 15:56:49.424047][warning][16162][UsbEnumeratorLibusb.cpp:399] Failed to open USB device: error=Access denied (insufficient permissions). Try again
+[08/18 15:56:49.474177][warning][16162][UsbEnumeratorLibusb.cpp:403] Failed to open USB device (Access denied (insufficient permissions)), skipping, info.serial and infName may be empty
+[08/18 15:56:49.476743][info][16162][LinuxUsbPal.cpp:335] Create PollingDeviceWatcher!
+[08/18 15:56:49.476823][info][16162][DeviceManager.cpp:25] Current found device(s): (4)
+[08/18 15:56:49.476837][info][16162][DeviceManager.cpp:34] 	- Name: Gemini 335, PID: 0x0800, SN/ID: , Connection: USB2.1
+[08/18 15:56:49.476846][info][16162][DeviceManager.cpp:34] 	- Name: Gemini 335, PID: 0x0800, SN/ID: , Connection: USB3.2
+[08/18 15:56:49.476853][info][16162][DeviceManager.cpp:34] 	- Name: Gemini 335, PID: 0x0800, SN/ID: , Connection: USB3.2
+[08/18 15:56:49.476861][info][16162][DeviceManager.cpp:34] 	- Name: Gemini 335, PID: 0x0800, SN/ID: , Connection: USB3.2
+[08/18 15:56:49.476871][info][16162][DeviceManager.cpp:339] Enable net device enumeration: true
+[08/18 15:56:51.485768][info][16162][DeviceManager.cpp:25] Current device(s) list: (4)
+[08/18 15:56:51.485855][info][16162][DeviceManager.cpp:34] 	- Name: Gemini 335, PID: 0x0800, SN/ID: , Connection: USB2.1
+[08/18 15:56:51.485866][info][16162][DeviceManager.cpp:34] 	- Name: Gemini 335, PID: 0x0800, SN/ID: , Connection: USB3.2
+[08/18 15:56:51.485873][info][16162][DeviceManager.cpp:34] 	- Name: Gemini 335, PID: 0x0800, SN/ID: , Connection: USB3.2
+[08/18 15:56:51.485878][info][16162][DeviceManager.cpp:34] 	- Name: Gemini 335, PID: 0x0800, SN/ID: , Connection: USB3.2

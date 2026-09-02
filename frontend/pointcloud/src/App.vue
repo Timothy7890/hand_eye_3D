@@ -667,7 +667,7 @@ onBeforeUnmount(() => {
         <section class="side-card solve-card">
           <div>
             <h2>3. 联合解算</h2>
-            <span>当前共 {{ samples.length }} 条观测</span>
+            <span>当前共 {{ samples.length }} 条有效标记观测</span>
           </div>
           <button class="solve-button" :disabled="solveBusy || samples.length < 6" @click="solve">
             {{ solveBusy ? '解算中…' : '运行手眼标定' }}

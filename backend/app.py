@@ -91,6 +91,18 @@ def _load_samples() -> list[dict]:
             items.append(json.loads(f.read_text()))
         except (OSError, json.JSONDecodeError):
             continue
+    if offline_backend is not None:
+        episode_names = getattr(offline_backend, "episode_names", None)
+        if callable(episode_names):
+            active = episode_names()
+            items = [
+                sample
+                for sample in items
+                if (
+                    _imported_episode(sample) is None
+                    or _imported_episode(sample) in active
+                )
+            ]
     return items
 
 

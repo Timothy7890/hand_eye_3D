@@ -411,6 +411,36 @@ class SampleProvenanceTest(unittest.TestCase):
                 app_module.offline_backend = old_offline_backend
 
 
+class OrphanedOfflineSamplesTest(unittest.TestCase):
+    def test_deleted_episode_samples_are_excluded(self):
+        from backend import app as app_module
+
+        old_save_path = app_module.save_path
+        old_offline_backend = app_module.offline_backend
+        with tempfile.TemporaryDirectory() as tempdir:
+            try:
+                app_module.save_path = Path(tempdir)
+                app_module.offline_backend = SimpleNamespace(
+                    episode_names=lambda: {"episode_0001"}
+                )
+                app_module.init_state()
+                samples_dir = Path(tempdir) / "samples"
+                (samples_dir / "0000.json").write_text(
+                    json.dumps({"index": 0, "episode": "episode_0001"}),
+                    encoding="utf-8",
+                )
+                (samples_dir / "0001.json").write_text(
+                    json.dumps({"index": 1, "episode": "episode_0002"}),
+                    encoding="utf-8",
+                )
+
+                loaded = app_module._load_samples()
+                self.assertEqual([sample["index"] for sample in loaded], [0])
+            finally:
+                app_module.save_path = old_save_path
+                app_module.offline_backend = old_offline_backend
+
+
 class BatchSampleApiTest(unittest.TestCase):
     @staticmethod
     def _observation(marker_id: str, color: str, episode: str) -> dict:
