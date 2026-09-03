@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import shutil
 import threading
 import time
@@ -68,6 +69,11 @@ mount_calib_path: Path | None = None
 samples_lock = threading.Lock()
 record_lock = threading.Lock()
 CAPABILITY_REGISTRY_URL = "http://127.0.0.1:18000/api/capability/registry"
+RECORD_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+ARM_DATASET_JOINTS = {
+    "right": list(RIGHT_ARM_DATASET_JOINTS),
+    "left": [name.replace("right_", "left_", 1) for name in RIGHT_ARM_DATASET_JOINTS],
+}
 
 app = FastAPI(title="Hand-Eye 3D (point + wrist-pose) Calibration")
 app.add_middleware(
@@ -173,6 +179,18 @@ def _recorded_episode_count() -> int:
     return sum(1 for path in record_task_dir.glob("episode_*/data.json") if path.is_file())
 
 
+def _arm_control_status() -> dict:
+    enabled = arm_factory is not None or arm_controller is not None
+    armed = arm_controller is not None
+    return {
+        "enabled": enabled,
+        "armed": armed,
+        "publishing": armed,
+        "arm": _active_arm(),
+        "mode": "armed" if armed else ("available" if enabled else "capture_only"),
+    }
+
+
 async def get_capability_hint() -> dict:
     """读取能力中心；不可达时仅返回 unavailable，由独立标定流程降级为 warning。"""
     import urllib.request
@@ -219,6 +237,7 @@ async def api_status():
         "arm": _active_arm(),
         "base_link": _active_base_link(),
         "wrist_link": _active_wrist_link(),
+        "arm_control": _arm_control_status(),
         "save_path": str(save_path),
         "sample_count": len(_load_samples()),
         "min_samples": MIN_SAMPLES_TOOL,
@@ -263,14 +282,130 @@ def _next_record_episode_name() -> str:
     return f"episode_{((max(used) + 1) if used else 0):04d}"
 
 
-def _record_episode(frame_count: int) -> dict:
+def _validated_record_id(body: dict, key: str) -> str | None:
+    if key not in body or body[key] is None:
+        return None
+    value = body[key]
+    if not isinstance(value, str) or not RECORD_ID_PATTERN.fullmatch(value):
+        raise ValueError(
+            f"{key} 必须是 1～128 位安全 ID，只能包含字母、数字、点、下划线、冒号或连字符"
+        )
+    return value
+
+
+def _validate_json_value(value, path: str = "stability") -> None:
+    if value is None or isinstance(value, (str, bool, int)):
+        return
+    if isinstance(value, float):
+        if not np.isfinite(value):
+            raise ValueError(f"{path} 包含非有限数值")
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _validate_json_value(item, f"{path}[{index}]")
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError(f"{path} 的键必须是字符串")
+            _validate_json_value(item, f"{path}.{key}")
+        return
+    raise ValueError(f"{path} 包含不支持的 JSON 值")
+
+
+def _validated_record_request(body: dict) -> dict:
+    try:
+        frame_count = int(body.get("frame_count", 5))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("frame_count 必须是整数") from exc
+    if not 3 <= frame_count <= 30:
+        raise ValueError("frame_count 必须在 3～30 之间")
+
+    target_q = body.get("target_q_rad")
+    if target_q is not None:
+        if (
+            not isinstance(target_q, list)
+            or any(
+                isinstance(value, bool) or not isinstance(value, (int, float))
+                for value in target_q
+            )
+        ):
+            raise ValueError("target_q_rad 必须是 7 个有限数值组成的数组")
+        try:
+            target_q_array = np.asarray(target_q, dtype=float)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("target_q_rad 必须是 7 个有限数值组成的数组") from exc
+        if target_q_array.shape != (7,) or not np.all(np.isfinite(target_q_array)):
+            raise ValueError("target_q_rad 必须是 7 个有限数值组成的数组")
+        target_q = target_q_array.tolist()
+
+    stability = body.get("stability")
+    if stability is not None:
+        if not isinstance(stability, dict):
+            raise ValueError("stability 必须是 JSON object")
+        _validate_json_value(stability)
+
+    return {
+        "frame_count": frame_count,
+        "run_id": _validated_record_id(body, "run_id"),
+        "waypoint_id": _validated_record_id(body, "waypoint_id"),
+        "capture_id": _validated_record_id(body, "capture_id"),
+        "target_q_rad": target_q,
+        "stability": stability,
+    }
+
+
+def _episode_result(episode_name: str, info: dict, *, idempotent_replay: bool) -> dict:
+    assert record_task_dir is not None
+    return {
+        "ok": True,
+        "episode": episode_name,
+        "frame_count": int(info["frame_count"]),
+        "path": str(record_task_dir / episode_name),
+        "run_id": info.get("run_id"),
+        "waypoint_id": info.get("waypoint_id"),
+        "capture_id": info.get("capture_id"),
+        "measured_q_rad": info.get("measured_q_rad"),
+        "idempotent_replay": idempotent_replay,
+    }
+
+
+def _find_recorded_capture(capture_id: str) -> dict | None:
+    if record_task_dir is None or not record_task_dir.is_dir():
+        return None
+    for data_path in sorted(record_task_dir.glob("episode_*/data.json")):
+        try:
+            payload = json.loads(data_path.read_text(encoding="utf-8"))
+            info = payload["info"]
+            if (
+                isinstance(info, dict)
+                and info.get("kind") == "hand_eye_calibration"
+                and info.get("capture_id") == capture_id
+            ):
+                return _episode_result(
+                    data_path.parent.name, info, idempotent_replay=True
+                )
+        except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+    return None
+
+
+def _record_episode(frame_count: int, orchestration: dict | None = None) -> dict:
     if offline_backend is not None:
         raise RuntimeError("离线处理模式不能继续拍摄")
     if record_task_dir is None:
         raise RuntimeError("未配置离线数据保存目录")
+    orchestration = orchestration or {}
+    active_arm = _active_arm()
+    if active_arm not in ARM_DATASET_JOINTS:
+        raise RuntimeError(f"不支持的手臂 {active_arm!r}，必须是 right 或 left")
+    state_key = f"{active_arm}_arm"
+    joint_order = ARM_DATASET_JOINTS[active_arm]
     read_arm_q = getattr(pose_provider, "read_arm_q", None)
     if not callable(read_arm_q):
-        raise RuntimeError("离线拍摄需要 --pose-source h2，以同步保存右臂关节角")
+        raise RuntimeError(
+            f"离线拍摄需要 --pose-source h2，以同步保存{active_arm}臂关节角"
+        )
     calibration = RGBDCalibration.from_file(rgbd_calib_path)
     camera_info = _active_camera_info()
     if not camera_info.get("recording_supported"):
@@ -301,6 +436,7 @@ def _record_episode(frame_count: int) -> dict:
             color = np.asarray(frame["color_bgr"], dtype=np.uint8)
             depth = np.asarray(frame["depth_z16"])
             q = np.asarray(read_arm_q(), dtype=float).reshape(-1)
+            joint_read_timestamp_ns = time.time_ns()
             if color.shape[:2] != calibration.color_shape or color.ndim != 3:
                 raise RuntimeError(
                     f"SDK 彩色帧尺寸 {color.shape[:2]} 与标定 "
@@ -312,7 +448,9 @@ def _record_episode(frame_count: int) -> dict:
                     f"实际为 {depth.dtype} {depth.shape}"
                 )
             if q.shape != (7,) or not np.all(np.isfinite(q)):
-                raise RuntimeError(f"H2 右臂关节角应为 7 个有限数值，实际 shape={q.shape}")
+                raise RuntimeError(
+                    f"H2 {active_arm}臂关节角应为 7 个有限数值，实际 shape={q.shape}"
+                )
             depth_scale_mm = float(frame["depth_scale_mm"])
             if not np.isclose(
                 depth_scale_mm, calibration.depth_scale_mm, rtol=0.0, atol=1e-6
@@ -334,10 +472,10 @@ def _record_episode(frame_count: int) -> dict:
                     "idx": index,
                     "colors": {"head_rgb": rgb_rel.as_posix()},
                     "depths": {"head_depth": depth_rel.as_posix()},
-                    "states": {"right_arm": {"qpos": q.tolist()}},
+                    "states": {state_key: {"qpos": q.tolist()}},
                     "timestamps": {
                         "sample_timestamp_ns": int(frame["timestamp_ns"]),
-                        "joint_read_timestamp_ns": time.time_ns(),
+                        "joint_read_timestamp_ns": joint_read_timestamp_ns,
                     },
                     "rgbd": {
                         "color_shape": list(color.shape[:2]),
@@ -351,17 +489,39 @@ def _record_episode(frame_count: int) -> dict:
                 }
             )
 
+        measured = np.asarray(
+            [row["states"][state_key]["qpos"] for row in rows], dtype=float
+        )
+        measured_summary = {
+            "sample_count": len(rows),
+            "mean_rad": np.mean(measured, axis=0).tolist(),
+            "median_rad": np.median(measured, axis=0).tolist(),
+            "min_rad": np.min(measured, axis=0).tolist(),
+            "max_rad": np.max(measured, axis=0).tolist(),
+            "range_rad": np.ptp(measured, axis=0).tolist(),
+        }
+        info = {
+            "version": "1.0.0",
+            "kind": "hand_eye_calibration",
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "frame_count": len(rows),
+            "robot": "H2",
+            "camera_serial": camera_info.get("serial"),
+            "camera_source": camera_info.get("source"),
+            "arm": active_arm,
+            "arm_state_key": state_key,
+            "joint_order": list(joint_order),
+            f"{state_key}_joint_order": list(joint_order),
+            "run_id": orchestration.get("run_id"),
+            "waypoint_id": orchestration.get("waypoint_id"),
+            "capture_id": orchestration.get("capture_id"),
+            "target_q_rad": orchestration.get("target_q_rad"),
+            "stability": orchestration.get("stability"),
+            "measured_q_rad": measured[-1].tolist(),
+            "measured_q_summary": measured_summary,
+        }
         payload = {
-            "info": {
-                "version": "1.0.0",
-                "kind": "hand_eye_calibration",
-                "created_at": datetime.now().isoformat(timespec="seconds"),
-                "frame_count": len(rows),
-                "robot": "H2",
-                "camera_serial": camera_info.get("serial"),
-                "camera_source": camera_info.get("source"),
-                "right_arm_joint_order": list(RIGHT_ARM_DATASET_JOINTS),
-            },
+            "info": info,
             "data": rows,
         }
         (temp_root / "data.json").write_text(
@@ -371,29 +531,28 @@ def _record_episode(frame_count: int) -> dict:
     except Exception:
         shutil.rmtree(temp_root, ignore_errors=True)
         raise
-    return {
-        "ok": True,
-        "episode": episode_name,
-        "frame_count": len(rows),
-        "path": str(final_root),
-    }
+    return _episode_result(episode_name, info, idempotent_replay=False)
 
 
 @app.post("/api/record/episode")
 async def api_record_episode(body: dict | None = None):
     body = body or {}
     try:
-        frame_count = int(body.get("frame_count", 5))
-    except (TypeError, ValueError):
-        return JSONResponse({"ok": False, "error": "frame_count 必须是整数"}, status_code=400)
-    if not 3 <= frame_count <= 30:
-        return JSONResponse(
-            {"ok": False, "error": "frame_count 必须在 3～30 之间"}, status_code=400
-        )
+        request = _validated_record_request(body)
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
     if not record_lock.acquire(blocking=False):
         return JSONResponse({"ok": False, "error": "正在拍摄上一组数据"}, status_code=409)
     try:
-        result = await asyncio.to_thread(_record_episode, frame_count)
+        if request["capture_id"]:
+            existing = await asyncio.to_thread(
+                _find_recorded_capture, request["capture_id"]
+            )
+            if existing is not None:
+                return existing
+        result = await asyncio.to_thread(
+            _record_episode, request["frame_count"], request
+        )
         return result
     except (OSError, RuntimeError, ValueError) as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
@@ -811,13 +970,13 @@ def _arm_absent():
 
 @app.get("/api/arm/status")
 async def api_arm_status():
-    if arm_factory is None and arm_controller is None:
-        return {"enabled": False}
+    base = _arm_control_status()
+    if not base["enabled"]:
+        return base
     if arm_controller is None:
-        return {"enabled": True, "armed": False}
+        return base
     st = arm_controller.status()
-    st["enabled"] = True
-    st["armed"] = True
+    st.update(base)
     return st
 
 
