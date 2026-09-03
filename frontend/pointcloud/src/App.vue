@@ -36,6 +36,9 @@ const mountDrafts = ref([])
 const mountSamples = ref([])
 const mountMinPoints = ref(3)
 const mountSavedCloudPoints = ref([])
+const mountCandidates = ref([])
+const mountCandidateWarnings = ref([])
+const mountCandidateBusy = ref(false)
 const mountProfiles = ref([])
 const selectedMountProfileId = ref('')
 const loadedMountProfileId = ref('')
@@ -72,6 +75,7 @@ let controls
 let cloudObject
 let cloudMaterial
 let markerGroup
+let mountCandidateGroup
 let resizeObserver
 let requestSerial = 0
 let pointerStart = null
@@ -130,6 +134,10 @@ const mountPairedIds = computed(() =>
 const mountPairedDrafts = computed(() =>
   mountDrafts.value.filter((item) => item.vertexIndex != null),
 )
+const mountCandidateCounts = computed(() => ({
+  red: mountCandidates.value.filter((item) => item.color === 'red').length,
+  green: mountCandidates.value.filter((item) => item.color === 'green').length,
+}))
 const mountSavedIds = computed(() =>
   new Set(mountSavedForEpisode.value.map((item) => item.point_id)),
 )
@@ -220,6 +228,8 @@ function initViewer() {
   scene.add(grid)
   markerGroup = new THREE.Group()
   scene.add(markerGroup)
+  mountCandidateGroup = new THREE.Group()
+  scene.add(mountCandidateGroup)
 
   renderer.domElement.addEventListener('pointerdown', onPointerDown)
   renderer.domElement.addEventListener('pointerup', onPointerUp)
@@ -385,6 +395,8 @@ async function loadPointCloud() {
   selections.value = []
   keepOnlyMountModelPoints()
   mountSavedCloudPoints.value = []
+  mountCandidates.value = []
+  mountCandidateWarnings.value = []
   cloudId.value = ''
   pointCount.value = 0
   refreshHighlights()
@@ -462,22 +474,42 @@ function onPointerUp(event) {
   raycaster.setFromCamera(mouse, camera)
   cloudObject.updateMatrixWorld(true)
   const position = cloudObject.geometry.getAttribute('position')
-  const candidate = raycaster
-    .intersectObject(cloudObject, false)
-    .filter((hit) => hit.index != null)
-    .map((hit) => {
-      const projected = new THREE.Vector3(
-        position.getX(hit.index),
-        position.getY(hit.index),
-        position.getZ(hit.index),
-      )
-        .applyMatrix4(cloudObject.matrixWorld)
-        .project(camera)
-      const dx = (projected.x - mouse.x) * rect.width / 2
-      const dy = (projected.y - mouse.y) * rect.height / 2
-      return { hit, screenDistancePx: Math.hypot(dx, dy) }
-    })
-    .sort((a, b) => a.screenDistancePx - b.screenDistancePx)[0]
+  let detectedCandidate = null
+  if (mode.value === 'mount' && mountCandidateGroup) {
+    const candidateHit = raycaster.intersectObjects(
+      mountCandidateGroup.children,
+      false,
+    )[0]
+    detectedCandidate = candidateHit?.object?.userData?.mountCandidate || null
+    if (detectedCandidate) {
+      const expectedColor = activeMountSlot.value?.side === 'palm' ? 'red' : 'green'
+      if (detectedCandidate.color !== expectedColor) {
+        infoMsg.value = `当前是${activeMountSlot.value?.label}，请选择${expectedColor === 'red' ? '红色' : '绿色'}候选点`
+        return
+      }
+    }
+  }
+  const candidate = detectedCandidate
+    ? {
+        hit: { index: Number(detectedCandidate.vertex_index) },
+        screenDistancePx: 0,
+      }
+    : raycaster
+        .intersectObject(cloudObject, false)
+        .filter((hit) => hit.index != null)
+        .map((hit) => {
+          const projected = new THREE.Vector3(
+            position.getX(hit.index),
+            position.getY(hit.index),
+            position.getZ(hit.index),
+          )
+            .applyMatrix4(cloudObject.matrixWorld)
+            .project(camera)
+          const dx = (projected.x - mouse.x) * rect.width / 2
+          const dy = (projected.y - mouse.y) * rect.height / 2
+          return { hit, screenDistancePx: Math.hypot(dx, dy) }
+        })
+        .sort((a, b) => a.screenDistancePx - b.screenDistancePx)[0]
   if (!candidate) {
     infoMsg.value = '没有命中点，请放大后重试'
     return
@@ -491,6 +523,17 @@ function onPointerUp(event) {
 
   if (mode.value === 'mount') {
     const draft = activeMountDraft.value
+    const duplicateDraft = mountDrafts.value.find(
+      (item) => item.point_id !== draft.point_id && item.vertexIndex === hit.index,
+    )
+    const duplicateSaved = mountSavedForEpisode.value.find(
+      (item) => item.point_id !== draft.point_id
+        && Number(item.vertex_index ?? item.provenance?.vertex_index) === hit.index,
+    )
+    if (duplicateDraft || duplicateSaved) {
+      infoMsg.value = `该实体候选已分配给 ${duplicateDraft?.label || duplicateSaved?.label || duplicateSaved?.point_id}`
+      return
+    }
     mountDrafts.value = [
       ...mountDrafts.value.filter((item) => item.point_id !== draft.point_id),
       {
@@ -498,6 +541,7 @@ function onPointerUp(event) {
         vertexIndex: hit.index,
         point,
         displayPoint,
+        candidateId: detectedCandidate?.candidate_id,
       },
     ]
     infoMsg.value = `${draft.label} 已完成配对（距点击 ${screenDistancePx.toFixed(1)} px）`
@@ -576,6 +620,39 @@ function refreshHighlights() {
     ]
     mesh.position.fromArray(displayPoint)
     markerGroup.add(mesh)
+  }
+  refreshMountCandidateMarkers()
+}
+
+function refreshMountCandidateMarkers() {
+  if (!mountCandidateGroup) return
+  while (mountCandidateGroup.children.length) {
+    const child = mountCandidateGroup.children[0]
+    mountCandidateGroup.remove(child)
+    child.geometry?.dispose()
+    child.material?.dispose()
+  }
+  mountCandidateGroup.visible = mode.value === 'mount'
+  if (!mountCandidateGroup.visible) return
+  const usedVertices = new Set([
+    ...mountSavedCloudPoints.value.map((item) => item.vertexIndex),
+    ...mountDrafts.value
+      .filter((item) => item.vertexIndex != null)
+      .map((item) => item.vertexIndex),
+  ])
+  for (const candidate of mountCandidates.value) {
+    if (usedVertices.has(candidate.vertex_index)) continue
+    const mesh = new THREE.Mesh(
+      new THREE.SphereGeometry(0.0065, 16, 12),
+      new THREE.MeshBasicMaterial({
+        color: candidate.color === 'red' ? '#ef4444' : '#22c55e',
+        transparent: true,
+        opacity: 0.55,
+      }),
+    )
+    mesh.position.fromArray(candidate.p_camera)
+    mesh.userData.mountCandidate = candidate
+    mountCandidateGroup.add(mesh)
   }
 }
 
@@ -783,7 +860,44 @@ function chooseNextMountCloudSlot(currentPointId = '') {
   return next
 }
 
-function beginMountCloudPairing() {
+async function detectMountCandidates() {
+  if (!selectedEpisode.value || !cloudId.value || mountCandidateBusy.value) return
+  mountCandidateBusy.value = true
+  errorMsg.value = ''
+  try {
+    const response = await fetch('/api/offline/detect-mount-candidates', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        episode: selectedEpisode.value,
+        stride: cloudStride.value,
+      }),
+    })
+    if (!response.ok) throw await responseError(response, '安装圆点检测失败')
+    const data = await response.json()
+    if (data.cloud_id !== cloudId.value) {
+      throw new Error('检测返回的点云已变化，请重新加载点云')
+    }
+    mountCandidates.value = data.candidates || []
+    mountCandidateWarnings.value = data.warnings || []
+    refreshMountCandidateMarkers()
+    const red = Number(data.counts?.red) || 0
+    const green = Number(data.counts?.green) || 0
+    infoMsg.value = `RGB 自动候选：红 ${red} 个，绿 ${green} 个`
+    if (data.rejected_count) {
+      infoMsg.value += `；另有 ${data.rejected_count} 个圆心缺少稳定深度`
+    }
+  } catch (error) {
+    mountCandidates.value = []
+    mountCandidateWarnings.value = []
+    refreshMountCandidateMarkers()
+    setError(error)
+  } finally {
+    mountCandidateBusy.value = false
+  }
+}
+
+async function beginMountCloudPairing() {
   if (!allMountModelPointsSelected.value) {
     mountViewport.value = 'model'
     infoMsg.value = `请先标完 16 个模型点，当前已完成 ${mountDraftIds.value.size} 个`
@@ -798,6 +912,7 @@ function beginMountCloudPairing() {
   infoMsg.value = next
     ? `模型 16 点已完成，请在当前 episode 点云选择 ${next.label}`
     : '当前 episode 的可见点已配对；可保存或选择其他 episode'
+  if (!mountCandidates.value.length) await detectMountCandidates()
 }
 
 function removeSelection(color) {
@@ -1497,6 +1612,7 @@ onBeforeUnmount(() => {
   handControls?.dispose()
   clearGroup(handMeshGroup)
   clearGroup(handPointGroup, true)
+  clearGroup(mountCandidateGroup, true)
   clearOverlay()
   for (const geometryPromise of stlCache.values()) {
     geometryPromise.then((geometry) => geometry.dispose()).catch(() => {})
@@ -1846,6 +1962,21 @@ onBeforeUnmount(() => {
                 撤销点云选择
               </button>
             </div>
+            <div class="mount-candidate-tools">
+              <button
+                class="secondary-button"
+                :disabled="!allMountModelPointsSelected || !cloudId || mountCandidateBusy"
+                @click="detectMountCandidates"
+              >
+                {{ mountCandidateBusy ? 'RGB识别中…' : '识别RGB红绿圆' }}
+              </button>
+              <span>
+                候选：红 {{ mountCandidateCounts.red }} · 绿 {{ mountCandidateCounts.green }}
+              </span>
+            </div>
+            <p v-if="mountCandidateWarnings.length" class="candidate-warning">
+              {{ mountCandidateWarnings[0] }}
+            </p>
             <div class="selection-list mount-selection-list">
               <article
                 v-for="item in mountPairedDrafts"
@@ -1867,8 +1998,8 @@ onBeforeUnmount(() => {
                 <button title="撤销此槽" @click="removeMountDraft(item.point_id)">×</button>
               </article>
               <p v-if="!mountPairedDrafts.length" class="empty-state">
-                先完成上方 16 个模型点，再进入当前 episode 点云配对可见实体点。
-                单个 episode 不要求看见全部 16 点。
+                RGB识别会在点云中显示半透明红/绿候选球。按照当前槽位顺序直接点击
+                同色候选；仍可点击普通点云手动修正。单个 episode 不要求看见全部16点。
               </p>
             </div>
             <button class="primary-button" :disabled="!canSaveMount" @click="saveMountSelections">

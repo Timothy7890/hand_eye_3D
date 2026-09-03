@@ -189,6 +189,43 @@ class OfflineEpisodeBackendTest(unittest.TestCase):
         np.testing.assert_allclose(T[3], [0.0, 0.0, 0.0, 1.0], atol=1e-12)
         np.testing.assert_allclose(T[:3, :3] @ T[:3, :3].T, np.eye(3), atol=1e-10)
 
+    def test_mount_rgb_candidate_maps_circle_center_to_cloud_vertex(self):
+        _write_episode(
+            self.root, "episode_0008", [980, 1000, 1020, 1010, 990]
+        )
+        backend = OfflineEpisodeBackend(self.root, self.calibration_path)
+        detected = [
+            {
+                "id": "marker-red-01",
+                "color": "red",
+                "center": [2.0, 1.0],
+                "radius_px": 3.0,
+                "confidence": 0.95,
+                "color_confidence": 0.96,
+                "circularity": 0.9,
+                "source": "auto",
+                "flags": [],
+            }
+        ]
+
+        with patch(
+            "backend.offline.detect_mount_markers_bgr",
+            return_value=detected,
+        ):
+            result = backend.detect_mount_candidates("episode_0008", stride=1)
+
+        self.assertEqual(result["candidate_count"], 1)
+        self.assertEqual(result["counts"], {"red": 1, "green": 0})
+        candidate = result["candidates"][0]
+        self.assertEqual(candidate["candidate_id"], "marker-red-01")
+        self.assertEqual(candidate["pixel"], [2, 1])
+        np.testing.assert_allclose(candidate["p_camera"], [0.01, 0.0, 1.0])
+        cloud = backend.point_cloud("episode_0008", 1)
+        self.assertEqual(
+            cloud.pixels[candidate["vertex_index"]].tolist(),
+            [2, 1],
+        )
+
     def test_serial_mismatch_is_visible_warning_not_validation_error(self):
         _write_episode(
             self.root,

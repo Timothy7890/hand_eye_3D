@@ -212,7 +212,12 @@ def _disk_values(
     return array[y0:y1, x0:x1][selection]
 
 
-def detect_markers_bgr(image: np.ndarray) -> list[dict[str, Any]]:
+def detect_markers_bgr(
+    image: np.ndarray,
+    *,
+    allowed_colors: set[str] | None = None,
+    keep_color_duplicates: bool = False,
+) -> list[dict[str, Any]]:
     """先检测贴在浅色手部上的圆形，再对圆心区域分类；允许只看见部分颜色。"""
     bgr = np.asarray(image)
     if bgr.ndim != 3 or bgr.shape[2] != 3 or bgr.dtype != np.uint8:
@@ -266,6 +271,8 @@ def detect_markers_bgr(image: np.ndarray) -> list[dict[str, Any]]:
         color, color_confidence, color_margin = _classify_circle_color(
             center_hsv, center_lab
         )
+        if allowed_colors is not None and color not in allowed_colors:
+            continue
         item = _CATALOG_BY_COLOR[color]
         flags: list[str] = []
         if color_margin < 0.20:
@@ -418,7 +425,7 @@ def detect_markers_bgr(image: np.ndarray) -> list[dict[str, Any]]:
             round(item["center"][0], 4),
         ),
     ):
-        if candidate["color"] in seen_colors:
+        if not keep_color_duplicates and candidate["color"] in seen_colors:
             continue
         seen_colors.add(candidate["color"])
         deduplicated.append(candidate)
@@ -431,10 +438,16 @@ def detect_markers_bgr(image: np.ndarray) -> list[dict[str, Any]]:
         )
     )
     result = []
+    color_counts: dict[str, int] = {}
     for item in deduplicated:
         item = dict(item)
         item.pop("_color_index", None)
-        item["id"] = f"marker-{item['color']}"
+        color_counts[item["color"]] = color_counts.get(item["color"], 0) + 1
+        item["id"] = (
+            f"marker-{item['color']}-{color_counts[item['color']]:02d}"
+            if keep_color_duplicates
+            else f"marker-{item['color']}"
+        )
         item["center"] = [round(value, 3) for value in item["center"]]
         item["radius_px"] = round(item["radius_px"], 3)
         item["confidence"] = round(item["confidence"], 6)
@@ -442,6 +455,15 @@ def detect_markers_bgr(image: np.ndarray) -> list[dict[str, Any]]:
         item["circularity"] = round(item["circularity"], 6)
         result.append(item)
     return result
+
+
+def detect_mount_markers_bgr(image: np.ndarray) -> list[dict[str, Any]]:
+    """检测手安装标定的重复红/绿圆，不按 canonical color 去重。"""
+    return detect_markers_bgr(
+        image,
+        allowed_colors={"red", "green"},
+        keep_color_duplicates=True,
+    )
 
 
 def detect_markers_jpeg(data: bytes) -> list[dict[str, Any]]:

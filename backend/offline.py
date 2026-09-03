@@ -12,7 +12,12 @@ from typing import Any
 import cv2
 import numpy as np
 
-from .markers import CANONICAL_COLORS, canonical_color, detect_markers_bgr
+from .markers import (
+    CANONICAL_COLORS,
+    canonical_color,
+    detect_markers_bgr,
+    detect_mount_markers_bgr,
+)
 from .paths import DEFAULT_RGBD_CALIB_PATH, H2_ROBOT_CONFIG_PATH
 from .rgbd import RGBDCalibration, SoftwareDepthAligner
 from .robotics import RobotModel, load_robot_config
@@ -397,6 +402,102 @@ class OfflineEpisodeBackend:
                 color for color in CANONICAL_COLORS if color not in detected_colors
             ],
             "warnings": [*episode.warnings, *detection_warnings],
+        }
+
+    def detect_mount_candidates(self, name: str, stride: int = 2) -> dict[str, Any]:
+        """检测重复红/绿圆，并映射到当前稳定点云中的最近顶点。"""
+        episode = self.load(name)
+        image = cv2.imread(
+            str(episode.representative.color_path), cv2.IMREAD_COLOR
+        )
+        if image is None or image.shape[:2] != self.calibration.color_shape:
+            raise EpisodeValidationError(
+                f"代表 RGB 图片无法用于安装圆点检测: {episode.representative.color_path}"
+            )
+        detected = detect_mount_markers_bgr(image)
+        cloud = self.point_cloud(name, stride)
+        cloud_pixels = cloud.pixels.astype(np.float64, copy=False)
+        candidates: list[dict[str, Any]] = []
+        rejected: list[dict[str, Any]] = []
+        used_vertices: set[int] = set()
+        for marker in detected:
+            center = np.asarray(marker["center"], dtype=np.float64)
+            search_radius = max(
+                4.0, float(marker["radius_px"]) * 0.9, float(stride) * 1.5
+            )
+            delta = cloud_pixels - center
+            nearby = np.flatnonzero(
+                (np.abs(delta[:, 0]) <= search_radius)
+                & (np.abs(delta[:, 1]) <= search_radius)
+            )
+            if not len(nearby):
+                rejected.append(
+                    {
+                        **marker,
+                        "error": "圆心附近没有稳定深度点",
+                    }
+                )
+                continue
+            distances_sq = np.sum(delta[nearby] ** 2, axis=1)
+            nearest = int(nearby[int(np.argmin(distances_sq))])
+            if nearest in used_vertices:
+                rejected.append(
+                    {
+                        **marker,
+                        "error": "与另一个圆映射到同一点云顶点",
+                    }
+                )
+                continue
+            if float(np.min(distances_sq)) > search_radius * search_radius:
+                rejected.append(
+                    {
+                        **marker,
+                        "error": "圆心附近没有足够接近的稳定深度点",
+                    }
+                )
+                continue
+            used_vertices.add(nearest)
+            point = cloud.points[nearest].astype(float)
+            candidates.append(
+                {
+                    **marker,
+                    "candidate_id": marker["id"],
+                    "vertex_index": nearest,
+                    "pixel": cloud.pixels[nearest].astype(int).tolist(),
+                    "p_camera": point.tolist(),
+                    "depth_mm": float(point[2] * 1000.0),
+                    "valid_depth_frames": int(cloud.valid_depth_frames[nearest]),
+                    "depth_spread_mm": float(cloud.depth_spread_mm[nearest]),
+                }
+            )
+        counts = {
+            color: sum(item["color"] == color for item in candidates)
+            for color in ("red", "green")
+        }
+        warnings_out = list(episode.warnings)
+        for color, count in counts.items():
+            if count > 8:
+                warnings_out.append(
+                    f"检测到 {count} 个{color}候选，超过预期 8 个，请人工排除误检"
+                )
+        if rejected:
+            warnings_out.append(
+                f"{len(rejected)} 个 RGB 圆心因缺少稳定深度未映射到点云"
+            )
+        return {
+            "ok": True,
+            "episode": episode.name,
+            "representative_frame": episode.representative.index,
+            "preview_url": f"/api/offline/episodes/{episode.name}/preview",
+            "image_size": [int(image.shape[1]), int(image.shape[0])],
+            "cloud_id": cloud.cloud_id,
+            "point_cloud_stride": cloud.stride,
+            "candidates": candidates,
+            "candidate_count": len(candidates),
+            "counts": counts,
+            "rejected": rejected,
+            "rejected_count": len(rejected),
+            "warnings": warnings_out,
         }
 
     def _wrist_pose(self, q: np.ndarray) -> np.ndarray:

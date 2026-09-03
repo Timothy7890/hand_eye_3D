@@ -12,10 +12,48 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from backend.markers import CANONICAL_COLORS, MARKER_CATALOG, detect_markers_jpeg
+from backend.markers import (
+    CANONICAL_COLORS,
+    MARKER_CATALOG,
+    detect_markers_jpeg,
+    detect_mount_markers_bgr,
+)
 
 
 class SyntheticMarkerDetectorTest(unittest.TestCase):
+    def test_mount_detector_keeps_eight_repeated_red_and_green_circles(self):
+        image = np.full((800, 1200, 3), 245, dtype=np.uint8)
+        colors = {
+            item["color"]: item["lab_bgr"]
+            for item in MARKER_CATALOG
+            if item["color"] in {"red", "green"}
+        }
+        expected = []
+        for row, color in enumerate(("red", "green")):
+            for index in range(8):
+                center = (180 + index * 120, 280 + row * 220)
+                expected.append((color, center))
+                cv2.circle(
+                    image,
+                    center,
+                    16,
+                    colors[color],
+                    thickness=-1,
+                    lineType=cv2.LINE_AA,
+                )
+
+        detected = detect_mount_markers_bgr(image)
+
+        self.assertEqual(len(detected), 16)
+        self.assertEqual(
+            [item["color"] for item in detected],
+            ["red"] * 8 + ["green"] * 8,
+        )
+        self.assertEqual(len({item["id"] for item in detected}), 16)
+        for candidate, (color, center) in zip(detected, expected):
+            self.assertEqual(candidate["color"], color)
+            np.testing.assert_allclose(candidate["center"], center, atol=2.0)
+
     def test_detects_eight_mm_scale_circle_in_full_hd_image(self):
         image = np.full((1080, 1920, 3), 245, dtype=np.uint8)
         cv2.circle(

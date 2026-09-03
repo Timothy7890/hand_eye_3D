@@ -825,6 +825,30 @@ button:disabled {
   width: 100%;
 }
 
+.mount-candidate-tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 7px;
+}
+
+.mount-candidate-tools .secondary-button {
+  width: auto;
+  padding: 6px 9px;
+}
+
+.mount-candidate-tools span,
+.candidate-warning {
+  color: #718198;
+  font-size: 9px;
+}
+
+.candidate-warning {
+  margin: 0 0 7px;
+  color: #f0ad38;
+  line-height: 1.4;
+}
+
 .mount-selection-list {
   max-height: 210px;
 }

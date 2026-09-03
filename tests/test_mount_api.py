@@ -291,6 +291,46 @@ class MountApiTest(unittest.TestCase):
 
     # ---------- 离线配对确认 ----------
 
+    def test_detect_mount_candidates_api_preserves_backend_payload(self):
+        calls = []
+
+        def detect(episode, stride):
+            calls.append((episode, stride))
+            return {
+                "ok": True,
+                "episode": episode,
+                "cloud_id": "cloud-test",
+                "point_cloud_stride": stride,
+                "candidates": [
+                    {
+                        "candidate_id": "marker-red-01",
+                        "color": "red",
+                        "vertex_index": 3,
+                        "p_camera": [0.01, 0.02, 1.0],
+                    }
+                ],
+                "candidate_count": 1,
+                "counts": {"red": 1, "green": 0},
+                "rejected": [],
+                "rejected_count": 0,
+                "warnings": [],
+            }
+
+        app_module.episode_backend = SimpleNamespace(
+            detect_mount_candidates=detect
+        )
+        response = self.client.post(
+            "/api/offline/detect-mount-candidates",
+            json={"episode": "episode_0001", "stride": 1},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(calls, [("episode_0001", 1)])
+        self.assertEqual(
+            response.json()["candidates"][0]["candidate_id"],
+            "marker-red-01",
+        )
+
     def test_confirm_mount_points_with_live_episode_backend(self):
         task_dir = self.root / "task"
         task_dir.mkdir()

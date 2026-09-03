@@ -608,6 +608,41 @@ async def api_delete_mount_model_point_profile(profile_id: str):
 # --------------- 离线点云配对确认 ---------------
 
 
+@router.post("/api/offline/detect-mount-candidates")
+async def api_detect_mount_candidates(body: dict):
+    state = _state()
+    backend = state._available_episode_backend()
+    if backend is None:
+        return JSONResponse(
+            {"ok": False, "error": "未配置可读取的 episode 任务目录"},
+            status_code=409,
+        )
+    try:
+        episode = body["episode"]
+        stride = body.get("stride", 2)
+        if not isinstance(episode, str) or not episode.strip():
+            raise ValueError("episode 必须是非空字符串")
+        if isinstance(stride, bool):
+            raise ValueError("stride 必须是整数")
+        stride = int(stride)
+    except (KeyError, TypeError, ValueError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    try:
+        return await asyncio.to_thread(
+            backend.detect_mount_candidates,
+            episode.strip(),
+            stride,
+        )
+    except EpisodeValidationError as exc:
+        status = 404 if "元数据不存在" in str(exc) else 422
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=status)
+    except (OSError, ValueError) as exc:
+        return JSONResponse(
+            {"ok": False, "error": f"安装圆点检测失败: {exc}"},
+            status_code=422,
+        )
+
+
 @router.post("/api/offline/confirm-mount-points")
 async def api_confirm_mount_points(body: dict):
     state = _state()
