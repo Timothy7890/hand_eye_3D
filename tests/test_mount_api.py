@@ -33,6 +33,10 @@ MOUNT_POINT_IDS = [
     "back-green-01",
     "back-green-02",
 ]
+PROFILE_POINT_IDS = [
+    *[f"palm-red-{index:02d}" for index in range(1, 9)],
+    *[f"back-green-{index:02d}" for index in range(1, 9)],
+]
 
 
 def _make_T(R: np.ndarray, t) -> np.ndarray:
@@ -50,6 +54,7 @@ class MountApiTest(unittest.TestCase):
         self.old_offline = app_module.offline_backend
         self.old_episode = app_module.episode_backend
         self.old_mount_calib = app_module.mount_calib_path
+        self.old_mount_profile_dir = app_module.mount_profile_dir
         self.old_pose_provider = app_module.pose_provider
         self.old_arm_side = app_module.arm_side
         self.old_camera = app_module.camera
@@ -57,6 +62,7 @@ class MountApiTest(unittest.TestCase):
         app_module.offline_backend = None
         app_module.episode_backend = None
         app_module.mount_calib_path = None
+        app_module.mount_profile_dir = self.root / "mount_model_profiles"
         app_module.arm_side = "right"
         app_module.pose_provider = SimpleNamespace(
             source="mock",
@@ -96,6 +102,7 @@ class MountApiTest(unittest.TestCase):
         app_module.offline_backend = self.old_offline
         app_module.episode_backend = self.old_episode
         app_module.mount_calib_path = self.old_mount_calib
+        app_module.mount_profile_dir = self.old_mount_profile_dir
         app_module.pose_provider = self.old_pose_provider
         app_module.arm_side = self.old_arm_side
         app_module.camera = self.old_camera
@@ -124,6 +131,163 @@ class MountApiTest(unittest.TestCase):
 
         missing = self.client.get("/api/hands/no-such-hand/model")
         self.assertEqual(missing.status_code, 404)
+
+    def _model_profile_body(self, name: str = "生产手点位") -> dict:
+        metadata = get_hand_model(HAND_ID).metadata()
+        link = metadata["links"][0]["link"]
+        return {
+            "schema_version": 1,
+            "name": name,
+            "hand_id": HAND_ID,
+            "points": [
+                {
+                    "point_id": point_id,
+                    "label": f"模型点 {index + 1}",
+                    "link": link,
+                    "p_local": [index * 0.001, 0.01, -0.02],
+                    "p_hand": [index * 0.001, 0.01, -0.02],
+                }
+                for index, point_id in enumerate(PROFILE_POINT_IDS)
+            ],
+        }
+
+    def test_model_point_profile_crud_and_same_name_overwrite(self):
+        self.assertEqual(
+            self.client.get(
+                f"/api/mount/model-point-profiles?hand_id={HAND_ID}"
+            ).json()["profiles"],
+            [],
+        )
+
+        created = self.client.post(
+            "/api/mount/model-point-profiles",
+            json=self._model_profile_body(),
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+        created_payload = created.json()
+        self.assertTrue(created_payload["created"])
+        profile = created_payload["profile"]
+        profile_id = profile["profile_id"]
+        self.assertEqual(len(profile_id), 64)
+        self.assertEqual(
+            [point["point_id"] for point in profile["points"]],
+            PROFILE_POINT_IDS,
+        )
+        self.assertTrue(
+            (app_module.mount_profile_dir / f"{profile_id}.json").is_file()
+        )
+
+        loaded = self.client.get(
+            f"/api/mount/model-point-profiles/{profile_id}"
+        )
+        self.assertEqual(loaded.status_code, 200)
+        self.assertEqual(loaded.json()["profile"], profile)
+
+        replacement = self._model_profile_body()
+        replacement["points"][0]["p_hand"] = [0.2, 0.1, 0.3]
+        overwritten = self.client.post(
+            "/api/mount/model-point-profiles", json=replacement
+        )
+        self.assertEqual(overwritten.status_code, 200, overwritten.text)
+        overwritten_payload = overwritten.json()
+        self.assertFalse(overwritten_payload["created"])
+        self.assertEqual(overwritten_payload["profile"]["profile_id"], profile_id)
+        self.assertEqual(
+            overwritten_payload["profile"]["created_at"], profile["created_at"]
+        )
+        self.assertEqual(
+            overwritten_payload["profile"]["points"][0]["p_hand"],
+            [0.2, 0.1, 0.3],
+        )
+
+        listing = self.client.get(
+            f"/api/mount/model-point-profiles?hand_id={HAND_ID}"
+        ).json()
+        self.assertEqual(listing["count"], 1)
+        self.assertEqual(listing["profiles"][0]["profile_id"], profile_id)
+
+        deleted = self.client.delete(
+            f"/api/mount/model-point-profiles/{profile_id}"
+        )
+        self.assertEqual(deleted.status_code, 200)
+        self.assertEqual(
+            self.client.get(
+                f"/api/mount/model-point-profiles/{profile_id}"
+            ).status_code,
+            404,
+        )
+
+    def test_model_point_profile_rejects_invalid_content(self):
+        partial = self._model_profile_body("未完成草稿")
+        partial["points"] = partial["points"][:1]
+        partial_response = self.client.post(
+            "/api/mount/model-point-profiles", json=partial
+        )
+        self.assertEqual(partial_response.status_code, 200)
+        partial_profile = partial_response.json()["profile"]
+        self.assertEqual(partial_profile["point_count"], 1)
+        self.assertFalse(partial_profile["complete"])
+
+        empty = self._model_profile_body("空草稿")
+        empty["points"] = []
+        self.assertEqual(
+            self.client.post(
+                "/api/mount/model-point-profiles", json=empty
+            ).status_code,
+            400,
+        )
+
+        duplicate = self._model_profile_body()
+        duplicate["points"][-1]["point_id"] = duplicate["points"][0]["point_id"]
+        duplicate_response = self.client.post(
+            "/api/mount/model-point-profiles", json=duplicate
+        )
+        self.assertEqual(duplicate_response.status_code, 400)
+        self.assertIn("重复", duplicate_response.json()["error"])
+
+        bad_link = self._model_profile_body()
+        bad_link["points"][0]["link"] = "../../not-a-link"
+        self.assertEqual(
+            self.client.post(
+                "/api/mount/model-point-profiles", json=bad_link
+            ).status_code,
+            400,
+        )
+
+        bad_vector = self._model_profile_body()
+        bad_vector["points"][0]["p_hand"] = ["nan", 0.0, 0.0]
+        self.assertEqual(
+            self.client.post(
+                "/api/mount/model-point-profiles", json=bad_vector
+            ).status_code,
+            400,
+        )
+
+        unknown_hand = self._model_profile_body()
+        unknown_hand["hand_id"] = "no-such-hand"
+        self.assertEqual(
+            self.client.post(
+                "/api/mount/model-point-profiles", json=unknown_hand
+            ).status_code,
+            404,
+        )
+
+    def test_model_point_profile_list_tolerates_bad_files(self):
+        app_module.mount_profile_dir.mkdir(parents=True, exist_ok=True)
+        (app_module.mount_profile_dir / "manual-name.json").write_text(
+            "{}", encoding="utf-8"
+        )
+        (app_module.mount_profile_dir / f"{'a' * 64}.json").write_text(
+            "{broken", encoding="utf-8"
+        )
+
+        response = self.client.get(
+            f"/api/mount/model-point-profiles?hand_id={HAND_ID}"
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["profiles"], [])
+        self.assertEqual(payload["invalid_count"], 2)
 
     # ---------- 离线配对确认 ----------
 

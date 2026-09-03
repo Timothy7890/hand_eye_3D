@@ -8,8 +8,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
+import threading
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -31,6 +34,14 @@ router = APIRouter()
 MOUNT_DEPTH_MIN_M = 0.30
 MOUNT_DEPTH_MAX_M = 1.5
 MOUNT_POINT_ID_RE = re.compile(r"^(?:palm-red|back-green)-(?:0[1-8])$")
+MOUNT_PROFILE_POINT_IDS = tuple(
+    [f"palm-red-{index:02d}" for index in range(1, 9)]
+    + [f"back-green-{index:02d}" for index in range(1, 9)]
+)
+MOUNT_PROFILE_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+MOUNT_PROFILE_NAME_MAX_LENGTH = 128
+MOUNT_PROFILE_LABEL_MAX_LENGTH = 128
+mount_profile_lock = threading.Lock()
 
 
 def _state():
@@ -44,6 +55,148 @@ def _mount_dir() -> Path:
     directory = _state().save_path / "mount_samples"
     directory.mkdir(parents=True, exist_ok=True)
     return directory
+
+
+def _mount_profile_dir() -> Path:
+    directory = _state().mount_profile_dir
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def _mount_profile_id(hand_id: str, name: str) -> str:
+    identity = json.dumps(
+        [hand_id, name], ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(identity).hexdigest()
+
+
+def _validated_mount_profile_id(profile_id: str) -> str:
+    if not isinstance(profile_id, str) or not MOUNT_PROFILE_ID_RE.fullmatch(profile_id):
+        raise ValueError("profile_id 必须是服务端生成的 64 位十六进制 ID")
+    return profile_id
+
+
+def _validated_profile_vector(value: Any, field: str, position: int) -> list[float]:
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        raise ValueError(f"第 {position} 个点的 {field} 必须是 3 个有限数")
+    if any(
+        isinstance(component, bool) or not isinstance(component, (int, float))
+        for component in value
+    ):
+        raise ValueError(f"第 {position} 个点的 {field} 必须是 3 个有限数")
+    normalized = [float(component) for component in value]
+    if not all(np.isfinite(component) for component in normalized):
+        raise ValueError(f"第 {position} 个点的 {field} 必须是 3 个有限数")
+    return normalized
+
+
+def _validated_mount_profile(body: dict) -> tuple[str, str, list[dict[str, Any]]]:
+    if not isinstance(body, dict):
+        raise ValueError("请求体必须是 JSON object")
+    if body.get("schema_version", 1) != 1:
+        raise ValueError("schema_version 必须是 1")
+
+    name = body.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("name 必须是非空字符串")
+    name = name.strip()
+    if len(name) > MOUNT_PROFILE_NAME_MAX_LENGTH:
+        raise ValueError(f"name 最长 {MOUNT_PROFILE_NAME_MAX_LENGTH} 个字符")
+
+    hand_id = body.get("hand_id")
+    if not isinstance(hand_id, str) or not hand_id.strip():
+        raise ValueError("hand_id 必须是非空字符串")
+    hand_id = hand_id.strip()
+    model = get_hand_model(hand_id)
+    metadata = model.metadata()
+    valid_links = {
+        item.get("link")
+        for item in metadata.get("links", [])
+        if isinstance(item, dict) and isinstance(item.get("link"), str)
+    }
+
+    points = body.get("points")
+    if not isinstance(points, list) or not 1 <= len(points) <= len(MOUNT_PROFILE_POINT_IDS):
+        raise ValueError("points 必须包含 1–16 个模型点")
+    normalized_by_id: dict[str, dict[str, Any]] = {}
+    for position, point in enumerate(points):
+        if not isinstance(point, dict):
+            raise ValueError(f"第 {position} 个点必须是 JSON object")
+        point_id = _validate_mount_point_id(point.get("point_id"), position)
+        if point_id in normalized_by_id:
+            raise ValueError(f"point_id {point_id} 重复")
+        label = point.get("label")
+        if not isinstance(label, str) or not label.strip():
+            raise ValueError(f"第 {position} 个点的 label 必须是非空字符串")
+        label = label.strip()
+        if len(label) > MOUNT_PROFILE_LABEL_MAX_LENGTH:
+            raise ValueError(
+                f"第 {position} 个点的 label 最长 "
+                f"{MOUNT_PROFILE_LABEL_MAX_LENGTH} 个字符"
+            )
+        link = point.get("link")
+        if not isinstance(link, str) or link not in valid_links:
+            raise ValueError(
+                f"第 {position} 个点的 link {link!r} 不属于手型号 "
+                f"{hand_id} 的零位模型 metadata links"
+            )
+        normalized_by_id[point_id] = {
+            "point_id": point_id,
+            "label": label,
+            "link": link,
+            "p_local": _validated_profile_vector(
+                point.get("p_local"), "p_local", position
+            ),
+            "p_hand": _validated_profile_vector(
+                point.get("p_hand"), "p_hand", position
+            ),
+        }
+    normalized = [
+        normalized_by_id[point_id]
+        for point_id in MOUNT_PROFILE_POINT_IDS
+        if point_id in normalized_by_id
+    ]
+    return name, hand_id, normalized
+
+
+def _read_mount_profile(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("方案文件根节点必须是 JSON object")
+    try:
+        name, hand_id, points = _validated_mount_profile(payload)
+    except (HandCatalogError, KeyError) as exc:
+        message = str(exc.args[0]) if isinstance(exc, KeyError) else str(exc)
+        raise ValueError(message) from exc
+    profile_id = payload.get("profile_id")
+    if profile_id != _mount_profile_id(hand_id, name):
+        raise ValueError("profile_id 与 hand_id/name 不一致")
+    for field in ("created_at", "updated_at"):
+        if not isinstance(payload.get(field), str) or not payload[field]:
+            raise ValueError(f"{field} 必须是非空字符串")
+    return {
+        "schema_version": 1,
+        "profile_id": profile_id,
+        "name": name,
+        "hand_id": hand_id,
+        "points": points,
+        "point_count": len(points),
+        "complete": len(points) == len(MOUNT_PROFILE_POINT_IDS),
+        "created_at": payload["created_at"],
+        "updated_at": payload["updated_at"],
+    }
+
+
+def _write_mount_profile_atomic(path: Path, payload: dict[str, Any]) -> None:
+    temp_path = path.parent / f".{path.stem}-{uuid.uuid4().hex}.tmp"
+    try:
+        temp_path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        temp_path.replace(path)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def _load_mount_samples() -> list[dict]:
@@ -291,6 +444,165 @@ async def api_hand_model(hand_id: str, joints: str | None = None):
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
     payload["ok"] = True
     return payload
+
+
+# --------------- 模型点命名方案（独立于 episode） ---------------
+
+
+@router.get("/api/mount/model-point-profiles")
+async def api_mount_model_point_profiles(hand_id: str | None = None):
+    if hand_id is not None:
+        hand_id = hand_id.strip()
+        if not hand_id:
+            return JSONResponse(
+                {"ok": False, "error": "hand_id 必须是非空字符串"},
+                status_code=400,
+            )
+        try:
+            get_hand_model(hand_id)
+        except HandCatalogError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+        except KeyError as exc:
+            return JSONResponse(
+                {"ok": False, "error": str(exc.args[0])}, status_code=404
+            )
+
+    profiles: list[dict[str, Any]] = []
+    invalid_profiles: list[dict[str, str]] = []
+    try:
+        with mount_profile_lock:
+            paths = sorted(_mount_profile_dir().glob("*.json"))
+            for path in paths:
+                if not MOUNT_PROFILE_ID_RE.fullmatch(path.stem):
+                    invalid_profiles.append(
+                        {"file": path.name, "error": "文件名不是服务端生成的 profile_id"}
+                    )
+                    continue
+                try:
+                    profile = _read_mount_profile(path)
+                    if profile.get("profile_id") != path.stem:
+                        raise ValueError("文件内容 profile_id 与文件名不一致")
+                except (OSError, json.JSONDecodeError, ValueError) as exc:
+                    invalid_profiles.append({"file": path.name, "error": str(exc)})
+                    continue
+                if hand_id is None or profile.get("hand_id") == hand_id:
+                    profiles.append(profile)
+    except OSError as exc:
+        return JSONResponse(
+            {"ok": False, "error": f"读取模型点方案目录失败: {exc}"},
+            status_code=500,
+        )
+    return {
+        "ok": True,
+        "profiles": profiles,
+        "count": len(profiles),
+        "invalid_profiles": invalid_profiles,
+        "invalid_count": len(invalid_profiles),
+    }
+
+
+@router.get("/api/mount/model-point-profiles/{profile_id}")
+async def api_mount_model_point_profile(profile_id: str):
+    try:
+        profile_id = _validated_mount_profile_id(profile_id)
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    try:
+        path = _mount_profile_dir() / f"{profile_id}.json"
+        with mount_profile_lock:
+            if not path.is_file():
+                return JSONResponse(
+                    {"ok": False, "error": "model point profile not found"},
+                    status_code=404,
+                )
+            profile = _read_mount_profile(path)
+    except (json.JSONDecodeError, ValueError) as exc:
+        return JSONResponse(
+            {"ok": False, "error": f"模型点方案文件损坏: {exc}"},
+            status_code=422,
+        )
+    except OSError as exc:
+        return JSONResponse(
+            {"ok": False, "error": f"读取模型点方案失败: {exc}"},
+            status_code=500,
+        )
+    if profile.get("profile_id") != profile_id:
+        return JSONResponse(
+            {"ok": False, "error": "模型点方案 profile_id 与文件名不一致"},
+            status_code=422,
+        )
+    return {"ok": True, "profile": profile}
+
+
+@router.post("/api/mount/model-point-profiles")
+async def api_save_mount_model_point_profile(body: dict):
+    try:
+        name, hand_id, points = _validated_mount_profile(body)
+    except HandCatalogError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+    except KeyError as exc:
+        return JSONResponse(
+            {"ok": False, "error": str(exc.args[0])}, status_code=404
+        )
+    except (TypeError, ValueError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+    profile_id = _mount_profile_id(hand_id, name)
+    now = datetime.now().isoformat(timespec="seconds")
+    try:
+        path = _mount_profile_dir() / f"{profile_id}.json"
+        with mount_profile_lock:
+            created = not path.is_file()
+            created_at = now
+            if not created:
+                try:
+                    previous = _read_mount_profile(path)
+                    previous_created_at = previous.get("created_at")
+                    if isinstance(previous_created_at, str) and previous_created_at:
+                        created_at = previous_created_at
+                except (OSError, json.JSONDecodeError, ValueError):
+                    pass
+            profile = {
+                "schema_version": 1,
+                "profile_id": profile_id,
+                "name": name,
+                "hand_id": hand_id,
+                "points": points,
+                "point_count": len(points),
+                "complete": len(points) == len(MOUNT_PROFILE_POINT_IDS),
+                "created_at": created_at,
+                "updated_at": now,
+            }
+            _write_mount_profile_atomic(path, profile)
+    except OSError as exc:
+        return JSONResponse(
+            {"ok": False, "error": f"保存模型点方案失败: {exc}"},
+            status_code=500,
+        )
+    return {"ok": True, "profile": profile, "created": created}
+
+
+@router.delete("/api/mount/model-point-profiles/{profile_id}")
+async def api_delete_mount_model_point_profile(profile_id: str):
+    try:
+        profile_id = _validated_mount_profile_id(profile_id)
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    try:
+        path = _mount_profile_dir() / f"{profile_id}.json"
+        with mount_profile_lock:
+            if not path.is_file():
+                return JSONResponse(
+                    {"ok": False, "error": "model point profile not found"},
+                    status_code=404,
+                )
+            path.unlink()
+    except OSError as exc:
+        return JSONResponse(
+            {"ok": False, "error": f"删除模型点方案失败: {exc}"},
+            status_code=500,
+        )
+    return {"ok": True, "profile_id": profile_id}
 
 
 # --------------- 离线点云配对确认 ---------------

@@ -36,6 +36,12 @@ const mountDrafts = ref([])
 const mountSamples = ref([])
 const mountMinPoints = ref(3)
 const mountSavedCloudPoints = ref([])
+const mountProfiles = ref([])
+const selectedMountProfileId = ref('')
+const loadedMountProfileId = ref('')
+const mountProfileName = ref('')
+const mountProfileBusy = ref(false)
+const mountProfileDirty = ref(false)
 const mountSaveBusy = ref(false)
 const mountSolveBusy = ref(false)
 const mountResult = ref(null)
@@ -108,6 +114,15 @@ const mountDraftIds = computed(() =>
 )
 const allMountModelPointsSelected = computed(() =>
   mountDraftIds.value.size === mountSlots.length,
+)
+const selectedMountProfile = computed(() =>
+  mountProfiles.value.find((profile) => profile.profile_id === selectedMountProfileId.value) || null,
+)
+const canSaveMountProfile = computed(() =>
+  mountDraftIds.value.size > 0
+  && Boolean(selectedHandId.value)
+  && Boolean(mountProfileName.value.trim())
+  && !mountProfileBusy.value,
 )
 const mountPairedIds = computed(() =>
   new Set(mountDrafts.value.filter((item) => item.vertexIndex != null).map((item) => item.point_id)),
@@ -488,7 +503,7 @@ function onPointerUp(event) {
     infoMsg.value = `${draft.label} 已完成配对（距点击 ${screenDistancePx.toFixed(1)} px）`
     refreshHighlights()
     refreshHandPointMarkers()
-    const next = chooseNextMountCloudSlot()
+    const next = chooseNextMountCloudSlot(draft.point_id)
     infoMsg.value = next
       ? `${draft.label} 已完成；下一项：${next.label}`
       : `${draft.label} 已完成；当前 episode 的点云配对已完成`
@@ -606,15 +621,160 @@ function keepOnlyMountModelPoints() {
     .map(modelOnlyMountDraft)
 }
 
-function chooseNextMountModelSlot() {
-  const next = mountSlots.find((slot) => !mountDraftIds.value.has(slot.point_id))
+async function refreshMountProfiles(handId = selectedHandId.value) {
+  if (!handId) {
+    mountProfiles.value = []
+    selectedMountProfileId.value = ''
+    return
+  }
+  const response = await fetch(
+    `/api/mount/model-point-profiles?hand_id=${encodeURIComponent(handId)}`,
+  )
+  if (!response.ok) throw await responseError(response, '模型点方案加载失败')
+  const data = await response.json()
+  mountProfiles.value = data.profiles || []
+  if (!mountProfiles.value.some(
+    (profile) => profile.profile_id === selectedMountProfileId.value,
+  )) {
+    selectedMountProfileId.value = mountProfiles.value[0]?.profile_id || ''
+  }
+}
+
+function selectMountProfile() {
+  if (selectedMountProfile.value) {
+    mountProfileName.value = selectedMountProfile.value.name
+  }
+}
+
+async function saveMountProfile() {
+  if (!canSaveMountProfile.value) return
+  mountProfileBusy.value = true
+  errorMsg.value = ''
+  try {
+    const points = mountSlots.flatMap((slot) => {
+      const draft = mountDrafts.value.find((item) => item.point_id === slot.point_id)
+      if (!draft?.p_hand) return []
+      return [{
+        point_id: slot.point_id,
+        label: slot.label,
+        link: draft.link,
+        p_local: draft.p_local,
+        p_hand: draft.p_hand,
+      }]
+    })
+    const response = await fetch('/api/mount/model-point-profiles', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        schema_version: 1,
+        name: mountProfileName.value.trim(),
+        hand_id: selectedHandId.value,
+        points,
+      }),
+    })
+    if (!response.ok) throw await responseError(response, '模型点方案保存失败')
+    const data = await response.json()
+    await refreshMountProfiles(selectedHandId.value)
+    selectedMountProfileId.value = data.profile.profile_id
+    loadedMountProfileId.value = data.profile.profile_id
+    mountProfileName.value = data.profile.name
+    mountProfileDirty.value = false
+    infoMsg.value = data.created
+      ? `模型点方案“${data.profile.name}”已保存（${data.profile.point_count}/16）`
+      : `模型点方案“${data.profile.name}”已覆盖（${data.profile.point_count}/16）`
+  } catch (error) {
+    setError(error)
+  } finally {
+    mountProfileBusy.value = false
+  }
+}
+
+async function loadMountProfile() {
+  const profileId = selectedMountProfileId.value
+  if (!profileId || mountProfileBusy.value) return
+  if (
+    mountProfileDirty.value
+    && !window.confirm('当前模型点有未保存修改，确定加载其他方案并覆盖吗？')
+  ) {
+    return
+  }
+  mountProfileBusy.value = true
+  errorMsg.value = ''
+  try {
+    const response = await fetch(
+      `/api/mount/model-point-profiles/${encodeURIComponent(profileId)}`,
+    )
+    if (!response.ok) throw await responseError(response, '模型点方案读取失败')
+    const data = await response.json()
+    const profile = data.profile
+    if (profile.hand_id !== selectedHandId.value) {
+      throw new Error('模型点方案与当前手型号不匹配')
+    }
+    mountDrafts.value = profile.points.map(modelOnlyMountDraft)
+    loadedMountProfileId.value = profile.profile_id
+    mountProfileName.value = profile.name
+    mountProfileDirty.value = false
+    activeMountSlotId.value = mountSlots.find(
+      (slot) => !mountDraftIds.value.has(slot.point_id),
+    )?.point_id || mountSlots[0].point_id
+    mountViewport.value = 'model'
+    refreshHighlights()
+    refreshHandPointMarkers()
+    infoMsg.value = `已加载模型点方案“${profile.name}”的 ${profile.points.length} 个点`
+  } catch (error) {
+    setError(error)
+  } finally {
+    mountProfileBusy.value = false
+  }
+}
+
+async function deleteMountProfile() {
+  const profile = selectedMountProfile.value
+  if (!profile || mountProfileBusy.value) return
+  if (!window.confirm(`确定删除模型点方案“${profile.name}”吗？`)) return
+  mountProfileBusy.value = true
+  errorMsg.value = ''
+  try {
+    const response = await fetch(
+      `/api/mount/model-point-profiles/${encodeURIComponent(profile.profile_id)}`,
+      { method: 'DELETE' },
+    )
+    if (!response.ok) throw await responseError(response, '模型点方案删除失败')
+    if (loadedMountProfileId.value === profile.profile_id) {
+      loadedMountProfileId.value = ''
+      mountProfileDirty.value = mountDraftIds.value.size > 0
+    }
+    await refreshMountProfiles(selectedHandId.value)
+    infoMsg.value = `模型点方案“${profile.name}”已删除；当前模型点未清空`
+  } catch (error) {
+    setError(error)
+  } finally {
+    mountProfileBusy.value = false
+  }
+}
+
+function nextMountSlotAfter(pointId, isPending) {
+  const currentIndex = mountSlots.findIndex((slot) => slot.point_id === pointId)
+  const ordered = currentIndex < 0
+    ? mountSlots
+    : [...mountSlots.slice(currentIndex + 1), ...mountSlots.slice(0, currentIndex)]
+  return ordered.find(isPending)
+}
+
+function chooseNextMountModelSlot(currentPointId = '') {
+  const next = nextMountSlotAfter(
+    currentPointId,
+    (slot) => !mountDraftIds.value.has(slot.point_id),
+  )
   if (next) activeMountSlotId.value = next.point_id
   return next
 }
 
-function chooseNextMountCloudSlot() {
-  const next = mountSlots.find((slot) =>
-    !mountPairedIds.value.has(slot.point_id) && !mountSavedIds.value.has(slot.point_id),
+function chooseNextMountCloudSlot(currentPointId = '') {
+  const next = nextMountSlotAfter(
+    currentPointId,
+    (slot) =>
+      !mountPairedIds.value.has(slot.point_id) && !mountSavedIds.value.has(slot.point_id),
   )
   if (next) {
     activeMountSlotId.value = next.point_id
@@ -779,11 +939,10 @@ function refreshHandPointMarkers() {
   }
   for (const item of byId.values()) {
     const active = activeMountSlotId.value === item.point_id
-    const paired = item.saved || item.vertexIndex != null
     const mesh = new THREE.Mesh(
       new THREE.SphereGeometry(active ? 0.0055 : 0.004, 16, 12),
       new THREE.MeshBasicMaterial({
-        color: active ? '#fbbf24' : paired ? mountSlotInfo(item.point_id).color : '#e2e8f0',
+        color: mountSlotInfo(item.point_id).color,
       }),
     )
     mesh.position.fromArray(item.p_hand)
@@ -819,6 +978,9 @@ async function loadHandModel() {
     if (serial !== handLoadSerial) return
     handModel.value = payload
     mountDrafts.value = savedModelDraftsForHand(payload.hand_id)
+    loadedMountProfileId.value = ''
+    mountProfileName.value = ''
+    mountProfileDirty.value = mountDrafts.value.length > 0
     activeMountSlotId.value = mountSlots.find(
       (slot) => !mountDraftIds.value.has(slot.point_id),
     )?.point_id || mountSlots[0].point_id
@@ -917,7 +1079,8 @@ function onHandPointerUp(event) {
       meshFaceIndex: hit.faceIndex,
     },
   ]
-  const next = chooseNextMountModelSlot()
+  mountProfileDirty.value = true
+  const next = chooseNextMountModelSlot(slot.point_id)
   infoMsg.value = next
     ? `${slot.label} 模型点已选；下一项：${next.label}`
     : '16 个模型点已全部标注，请点击“开始当前 episode 点云配对”'
@@ -939,6 +1102,7 @@ function removeMountDraft(pointId) {
 
 function clearMountDrafts() {
   mountDrafts.value = []
+  mountProfileDirty.value = true
   activeMountSlotId.value = mountSlots[0].point_id
   mountViewport.value = 'model'
   refreshHighlights()
@@ -1143,6 +1307,7 @@ async function setMode(nextMode) {
     if (!mountSamples.value.length) await refreshMountSamples()
     if (!hands.value.length) await loadHandsCatalog()
     if (selectedHandId.value && !handModel.value) await loadHandModel()
+    await refreshMountProfiles(selectedHandId.value)
     restoreSavedMountPoints(cloudObject?.geometry)
     refreshHighlights()
   } catch (error) {
@@ -1292,7 +1457,10 @@ watch(cloudStride, async (value, oldValue) => {
 watch(selectedHandId, async (value, oldValue) => {
   if (value && value !== oldValue && mode.value === 'mount' && handRenderer) {
     mountViewport.value = 'model'
+    mountProfiles.value = []
+    selectedMountProfileId.value = ''
     await loadHandModel()
+    await refreshMountProfiles(value)
   }
 })
 
@@ -1512,10 +1680,72 @@ onBeforeUnmount(() => {
             </button>
           </section>
 
+          <section class="side-card mount-profile-card">
+            <div class="panel-heading compact">
+              <div>
+                <h2>2. 模型点方案</h2>
+                <span>标注任意数量即可保存草稿 · 重启后继续</span>
+              </div>
+              <span v-if="mountProfileDirty" class="profile-dirty">未保存修改</span>
+            </div>
+            <div class="profile-save-row">
+              <input
+                v-model="mountProfileName"
+                maxlength="128"
+                placeholder="输入方案名称"
+                :disabled="mountProfileBusy"
+              />
+              <button
+                class="primary-button"
+                :disabled="!canSaveMountProfile"
+                @click="saveMountProfile"
+              >
+                {{ mountProfileBusy ? '处理中…' : '保存/覆盖' }}
+              </button>
+            </div>
+            <div class="profile-load-row">
+              <select
+                v-model="selectedMountProfileId"
+                :disabled="mountProfileBusy || !mountProfiles.length"
+                @change="selectMountProfile"
+              >
+                <option value="">选择已有方案</option>
+                <option
+                  v-for="profile in mountProfiles"
+                  :key="profile.profile_id"
+                  :value="profile.profile_id"
+                >
+                  {{ profile.name }}（{{ profile.point_count ?? profile.points?.length ?? 0 }}/16）
+                </option>
+              </select>
+              <button
+                class="secondary-button"
+                :disabled="!selectedMountProfileId || mountProfileBusy"
+                @click="loadMountProfile"
+              >
+                加载
+              </button>
+              <button
+                class="text-button"
+                :disabled="!selectedMountProfileId || mountProfileBusy"
+                @click="deleteMountProfile"
+              >
+                删除
+              </button>
+            </div>
+            <p class="model-meta">
+              {{
+                loadedMountProfileId
+                  ? `当前已加载：${mountProfileName}`
+                  : `${mountProfiles.length} 个可用方案`
+              }}
+            </p>
+          </section>
+
           <section class="side-card mount-slots-card">
             <div class="panel-heading compact">
               <div>
-                <h2>2. 先标注手模型的 16 个点</h2>
+                <h2>3. 先标注手模型的 16 个点</h2>
                 <span>
                   已完成 {{ mountDraftIds.size }}/16 · 全部完成后再进入点云
                 </span>
@@ -1603,7 +1833,7 @@ onBeforeUnmount(() => {
           <section class="side-card grow">
             <div class="panel-heading compact">
               <div>
-                <h2>3. 当前 episode 点云配对</h2>
+                <h2>4. 当前 episode 点云配对</h2>
                 <span>
                   {{ mountPairedIds.size }} 对待保存 · {{ mountSavedForEpisode.length }} 对已保存
                 </span>
@@ -1649,7 +1879,7 @@ onBeforeUnmount(() => {
           <section class="side-card mount-samples-card">
             <div class="panel-heading compact">
               <div>
-                <h2>4. 安装样本与解算</h2>
+                <h2>5. 安装样本与解算</h2>
                 <span>{{ mountSamples.length }} 条样本 · {{ mountSamplesByPose }} 个姿态</span>
               </div>
             </div>

@@ -680,6 +680,44 @@ button:disabled {
   white-space: nowrap;
 }
 
+.profile-dirty {
+  color: #f0ad38;
+  font-size: 9px;
+  white-space: nowrap;
+}
+
+.profile-save-row,
+.profile-load-row {
+  display: grid;
+  gap: 6px;
+}
+
+.profile-save-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.profile-load-row {
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  margin-top: 7px;
+}
+
+.profile-save-row input,
+.profile-load-row select {
+  min-width: 0;
+  padding: 7px 8px;
+  border: 1px solid #233147;
+  border-radius: 6px;
+  background: #101826;
+  color: #d7e1ee;
+  font-size: 10px;
+}
+
+.profile-save-row .primary-button,
+.profile-load-row .secondary-button {
+  width: auto;
+  padding: 7px 9px;
+}
+
 .mount-slots-card {
   padding-bottom: 10px;
 }

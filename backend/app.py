@@ -67,6 +67,7 @@ teleop_task_dir: Path | None = None
 record_task_dir: Path | None = None
 rgbd_calib_path: Path = DEFAULT_RGBD_CALIB_PATH
 mount_calib_path: Path | None = None
+mount_profile_dir: Path = PROJECT_ROOT / "handeye3d_data" / "mount_model_profiles"
 samples_lock = threading.Lock()
 record_lock = threading.Lock()
 CAPABILITY_REGISTRY_URL = "http://127.0.0.1:18000/api/capability/registry"
@@ -88,6 +89,7 @@ def init_state() -> None:
     (save_path / "samples").mkdir(parents=True, exist_ok=True)
     (save_path / "pivot_samples").mkdir(parents=True, exist_ok=True)
     (save_path / "mount_samples").mkdir(parents=True, exist_ok=True)
+    mount_profile_dir.mkdir(parents=True, exist_ok=True)
     if record_task_dir is not None:
         record_task_dir.mkdir(parents=True, exist_ok=True)
 

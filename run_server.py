@@ -77,6 +77,11 @@ def main() -> int:
         default=None,
         help="手安装标定固定使用的相机外参 JSON；未指定时使用当前会话结果",
     )
+    parser.add_argument(
+        "--mount-profile-dir",
+        default=str(PROJECT_ROOT / "handeye3d_data" / "mount_model_profiles"),
+        help="手安装模型点命名方案目录（默认固定在项目 handeye3d_data 下）",
+    )
 
     parser.add_argument("--pose-source", choices=["manual", "http", "h2", "mock"],
                         default="manual", help="手腕位姿来源（默认 manual 手填）")
@@ -198,6 +203,9 @@ def main() -> int:
         if args.mount_calib
         else None
     )
+    app_module.mount_profile_dir = (
+        Path(args.mount_profile_dir).expanduser().resolve()
+    )
     app_module.init_state()
 
     print(f"[handeye3d] save_path = {session_dir}")
@@ -205,6 +213,7 @@ def main() -> int:
         print(f"[handeye3d] record_task_dir = {app_module.record_task_dir}")
     if app_module.mount_calib_path is not None:
         print(f"[handeye3d] mount_calib = {app_module.mount_calib_path}")
+    print(f"[handeye3d] mount_profile_dir = {app_module.mount_profile_dir}")
     print(f"[handeye3d] serving on http://{args.host}:{args.port}")
 
     import uvicorn
