@@ -21,8 +21,10 @@ import numpy as np
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 from .camera import CameraBase, MockCamera
+from .mount_api import router as mount_router
 from .offline import (
     DEFAULT_RGBD_CALIB_PATH,
     EpisodeValidationError,
@@ -31,6 +33,7 @@ from .offline import (
     RIGHT_ARM_DATASET_JOINTS,
 )
 from .markers import CANONICAL_COLORS, canonical_color, marker_catalog_public
+from .paths import PROJECT_ROOT
 from .robot import ManualPoseProvider, PoseProvider
 from .rgbd import RGBDCalibration
 from .solver import (
@@ -55,23 +58,29 @@ pose_provider: PoseProvider = ManualPoseProvider()
 arm_factory = None      # run_server 传 --arm-control 时注入（工厂，点「获取控制」才创建）
 arm_controller = None   # 当前接管中的 H2ArmController（None = 未接管）
 arm_lock = threading.Lock()
+arm_side: str = "right"
 save_path: Path = Path("./handeye3d_data")
 offline_backend: OfflineEpisodeBackend | None = None
 teleop_task_dir: Path | None = None
 record_task_dir: Path | None = None
 rgbd_calib_path: Path = DEFAULT_RGBD_CALIB_PATH
+mount_calib_path: Path | None = None
 samples_lock = threading.Lock()
 record_lock = threading.Lock()
+CAPABILITY_REGISTRY_URL = "http://127.0.0.1:18000/api/capability/registry"
 
 app = FastAPI(title="Hand-Eye 3D (point + wrist-pose) Calibration")
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
+app.include_router(mount_router)
+app.mount("/assets", StaticFiles(directory=str(PROJECT_ROOT / "assets")), name="assets")
 
 
 def init_state() -> None:
     (save_path / "samples").mkdir(parents=True, exist_ok=True)
     (save_path / "pivot_samples").mkdir(parents=True, exist_ok=True)
+    (save_path / "mount_samples").mkdir(parents=True, exist_ok=True)
     if record_task_dir is not None:
         record_task_dir.mkdir(parents=True, exist_ok=True)
 
@@ -131,6 +140,12 @@ def _active_pose_source() -> str:
     return "offline_teleop_episode" if offline_backend is not None else pose_provider.source
 
 
+def _active_arm() -> str:
+    if offline_backend is not None:
+        return str(getattr(offline_backend, "arm", "right"))
+    return arm_side
+
+
 def _active_base_link() -> str:
     return offline_backend.base_link if offline_backend is not None else pose_provider.base_link
 
@@ -158,6 +173,39 @@ def _recorded_episode_count() -> int:
     return sum(1 for path in record_task_dir.glob("episode_*/data.json") if path.is_file())
 
 
+async def get_capability_hint() -> dict:
+    """读取能力中心；不可达时仅返回 unavailable，由独立标定流程降级为 warning。"""
+    import urllib.request
+
+    def _fetch():
+        request = urllib.request.Request(
+            CAPABILITY_REGISTRY_URL, headers={"Accept": "application/json"}
+        )
+        with urllib.request.urlopen(request, timeout=1.5) as response:
+            return json.loads(response.read().decode("utf-8", errors="replace"))
+
+    try:
+        data = await asyncio.to_thread(_fetch)
+        registry = data.get("registry") or {}
+        active = registry.get("active") or {}
+        arm_name = str(active.get("arm") or "")
+        hand_id = active.get("hand_id")
+        hand = next(
+            (item for item in registry.get("hands", []) if item.get("id") == hand_id),
+            {},
+        )
+        return {
+            "ok": True,
+            "available": bool(active),
+            "active": active,
+            "arm": arm_name.removesuffix("_arm") if arm_name else None,
+            "hand_id": hand_id,
+            "hand_name": hand.get("name") or hand_id,
+        }
+    except Exception as exc:
+        return {"ok": True, "available": False, "error": str(exc)}
+
+
 # --------------- 状态 / 相机 ---------------
 
 
@@ -168,6 +216,7 @@ async def api_status():
         "camera": _active_camera_info(),
         "pose_source": _active_pose_source(),
         "pose_auto": False if offline_backend is not None else pose_provider.available,
+        "arm": _active_arm(),
         "base_link": _active_base_link(),
         "wrist_link": _active_wrist_link(),
         "save_path": str(save_path),
@@ -175,6 +224,7 @@ async def api_status():
         "min_samples": MIN_SAMPLES_TOOL,
         "teleop_task_dir": str(teleop_task_dir) if teleop_task_dir else None,
         "rgbd_calib": str(rgbd_calib_path),
+        "mount_calib": str(mount_calib_path) if mount_calib_path else None,
         "recording": {
             "enabled": (
                 offline_backend is None
@@ -193,6 +243,11 @@ async def api_status():
             "serial_mismatch_policy": "warning",
         },
     }
+
+
+@app.get("/api/capability-hint")
+async def api_capability_hint():
+    return await get_capability_hint()
 
 
 def _next_record_episode_name() -> str:

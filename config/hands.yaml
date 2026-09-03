@@ -1,0 +1,60 @@
+# 灵巧手型号目录：手安装标定（T_wrist2hand）用。
+#
+# id 与 IK_replay 四级能力体系的手型号 id 保持一致（yinshi-1-right 等）。
+# actuated_joints 是设备可控的 6 个驱动关节（18099 归零的就是它们）；
+# URDF 里的 mimic 联动关节由后端自动展开，不用列出。
+# feature_points 省略时自动取所有名字含 "tip" 的叶子 link 原点。
+# extra_feature_points 可补充 link 局部坐标系下的自定义点（米）。
+
+hands:
+  yinshi-1-right:
+    label: 因时-右-1
+    vendor: inspire
+    side: right
+    urdf_path: assets/hands/inspire/inspire_hand_right.urdf
+    actuated_joints:
+      - R_thumb_proximal_yaw_joint
+      - R_thumb_proximal_pitch_joint
+      - R_index_proximal_joint
+      - R_middle_proximal_joint
+      - R_ring_proximal_joint
+      - R_pinky_proximal_joint
+
+  yinshi-1-left:
+    label: 因时-左-1
+    vendor: inspire
+    side: left
+    urdf_path: assets/hands/inspire/inspire_hand_left.urdf
+    actuated_joints:
+      - L_thumb_proximal_yaw_joint
+      - L_thumb_proximal_pitch_joint
+      - L_index_proximal_joint
+      - L_middle_proximal_joint
+      - L_ring_proximal_joint
+      - L_pinky_proximal_joint
+
+  qiangnao-1-right:
+    label: 强脑-右-1
+    vendor: brainco
+    side: right
+    urdf_path: assets/hands/brainco/brainco_right.urdf
+    actuated_joints:
+      - right_thumb_metacarpal_joint
+      - right_thumb_proximal_joint
+      - right_index_proximal_joint
+      - right_middle_proximal_joint
+      - right_ring_proximal_joint
+      - right_pinky_proximal_joint
+
+  qiangnao-1-left:
+    label: 强脑-左-1
+    vendor: brainco
+    side: left
+    urdf_path: assets/hands/brainco/brainco_left.urdf
+    actuated_joints:
+      - left_thumb_metacarpal_joint
+      - left_thumb_proximal_joint
+      - left_index_proximal_joint
+      - left_middle_proximal_joint
+      - left_ring_proximal_joint
+      - left_pinky_proximal_joint

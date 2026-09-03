@@ -18,6 +18,11 @@ export default defineConfig({
         timeout: 120000,
         proxyTimeout: 120000,
       },
+      '/assets': {
+        target: BACKEND,
+        timeout: 120000,
+        proxyTimeout: 120000,
+      },
     },
   },
   build: {

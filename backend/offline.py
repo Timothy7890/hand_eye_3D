@@ -859,6 +859,144 @@ class OfflineEpisodeBackend:
             "warnings": list(episode.warnings),
         }
 
+    def confirm_mount_points(
+        self,
+        name: str,
+        cloud_id: str,
+        stride: int,
+        hand: dict[str, Any],
+        selections: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """生成自由模型点与相机点的手安装 observation（schema v3）。"""
+        if not isinstance(cloud_id, str) or not cloud_id.strip():
+            raise EpisodeValidationError("cloud_id 必须是非空字符串")
+        if not isinstance(selections, list) or not selections:
+            raise EpisodeValidationError("selections 必须是非空数组")
+        episode = self.load(name)
+        cloud = self.point_cloud(name, stride)
+        if cloud.cloud_id != cloud_id.strip():
+            raise PointCloudStaleError("点云已经变化，请重新加载后再选点")
+
+        normalized: list[dict[str, Any]] = []
+        for position, selection in enumerate(selections):
+            if not isinstance(selection, dict):
+                raise EpisodeValidationError(
+                    f"第 {position} 个 selection 必须是 JSON object"
+                )
+            point_id = selection.get("point_id", selection.get("id"))
+            if not isinstance(point_id, str) or not point_id.strip():
+                raise EpisodeValidationError(
+                    f"第 {position} 个 selection 缺少非空 point_id"
+                )
+            try:
+                p_hand = np.asarray(selection["p_hand"], dtype=float).reshape(3)
+                p_local = np.asarray(
+                    selection.get("p_local", p_hand), dtype=float
+                ).reshape(3)
+                vertex_index = int(selection["vertex_index"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise EpisodeValidationError(
+                    f"第 {position} 个 selection 的模型点或 vertex_index 不合法"
+                ) from exc
+            if not np.all(np.isfinite(p_hand)) or not np.all(np.isfinite(p_local)):
+                raise EpisodeValidationError(
+                    f"第 {position} 个 selection 的模型点包含非法值"
+                )
+            if vertex_index < 0 or vertex_index >= len(cloud.points):
+                raise EpisodeValidationError(
+                    f"第 {position} 个 selection 的 vertex_index {vertex_index} 越界，"
+                    f"点云共有 {len(cloud.points)} 个顶点"
+                )
+            normalized.append(
+                {
+                    "point_id": point_id.strip(),
+                    "label": str(selection.get("label") or point_id.strip()),
+                    "link": selection.get("link"),
+                    "p_local": p_local.tolist(),
+                    "p_hand": p_hand.tolist(),
+                    "vertex_index": vertex_index,
+                }
+            )
+        point_ids = [item["point_id"] for item in normalized]
+        if len(set(point_ids)) != len(point_ids):
+            raise EpisodeValidationError("同一姿态中每个模型点只能确认一次")
+
+        q_median = np.median(
+            np.stack([frame.right_q for frame in episode.frames]), axis=0
+        )
+        T_base_wrist = self._wrist_pose(q_median)
+        representative = episode.representative
+        observations = []
+        for selection in normalized:
+            index = selection["vertex_index"]
+            point = cloud.points[index].astype(float)
+            pixel = cloud.pixels[index].astype(int)
+            valid_frames = int(cloud.valid_depth_frames[index])
+            spread = float(cloud.depth_spread_mm[index])
+            observations.append(
+                {
+                    "schema_version": 3,
+                    "point_id": selection["point_id"],
+                    "label": selection["label"],
+                    "link": selection["link"],
+                    "hand_id": hand["hand_id"],
+                    "hand_base_link": hand["base_link"],
+                    "hand_joints": hand["joints"],
+                    "p_local": selection["p_local"],
+                    "p_hand": selection["p_hand"],
+                    "episode": episode.name,
+                    "pose_id": episode.name,
+                    "arm": "right",
+                    "source": "point_cloud",
+                    "vertex_index": index,
+                    "cloud_id": cloud.cloud_id,
+                    "point_cloud_stride": cloud.stride,
+                    "pixel": pixel.tolist(),
+                    "p_camera": point.tolist(),
+                    "T_base_wrist": T_base_wrist.tolist(),
+                    "depth_mm": float(point[2] * 1000.0),
+                    "valid_depth_frames": valid_frames,
+                    "depth_frame_count": len(episode.frames),
+                    "depth_spread_mm": spread,
+                    "qpos_median_rad": q_median.tolist(),
+                    "right_arm_q_median": q_median.tolist(),
+                    "base_link": self.base_link,
+                    "wrist_link": self.wrist_link,
+                    "camera_serial": episode.info.get("camera_serial"),
+                    "provenance": {
+                        "mode": "offline_point_cloud_mount",
+                        "episode": episode.name,
+                        "task_dir": str(self.task_dir),
+                        "data_json": str(episode.data_path),
+                        "rgbd_calibration": str(self.rgbd_calib_path),
+                        "camera_serial": episode.info.get("camera_serial"),
+                        "frame_indices": [frame.index for frame in episode.frames],
+                        "representative_frame": representative.index,
+                        "representative_rgb": str(representative.color_path),
+                        "cloud_id": cloud.cloud_id,
+                        "point_cloud_stride": cloud.stride,
+                        "vertex_index": index,
+                        "pixel": pixel.tolist(),
+                        "qpos_median_rad": q_median.tolist(),
+                    },
+                }
+            )
+
+        return {
+            "ok": True,
+            "episode": episode.name,
+            "pose_id": episode.name,
+            "arm": "right",
+            "cloud_id": cloud.cloud_id,
+            "point_cloud_stride": cloud.stride,
+            "observations": observations,
+            "confirmed_count": len(observations),
+            "T_base_wrist": T_base_wrist.tolist(),
+            "qpos_median_rad": q_median.tolist(),
+            "burst_frames_used": len(episode.frames),
+            "warnings": list(episode.warnings),
+        }
+
     def confirm_markers(
         self, name: str, edited_markers: list[dict[str, Any]]
     ) -> dict[str, Any]:

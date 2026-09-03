@@ -128,6 +128,7 @@ cd frontend && npm run dev:pointcloud      # http://<IP>:7013 点云版
 TELEOP_TASK_DIR=/path/to/task \
 CALIB_SAVE_PATH=/path/to/output \
 RGBD_CALIB=/path/to/orbbec_rgbd_calibration.json \
+MOUNT_CALIB=/path/to/handeye3d_result.json \
 ./start_multicolor_calibration.sh
 ```
 
@@ -152,6 +153,30 @@ RGBD_CALIB=/path/to/orbbec_rgbd_calibration.json \
 
 点云默认按 2× 像素步长采样；小 marker 难以命中时切换为 1× 精细模式。每个
 episode 的每种 canonical color 仍然只能保存一个观测。
+
+#### 7013 灵巧手安装标定（8 红点 + 8 绿点）
+
+已有相机外参后，可在 7013 切换到「手安装标定」，求解固定安装变换
+`T_wrist2hand`（腕系 ← 灵巧手模型基座系）。7012 的深度叠加、episode
+录制和原有 marker 标定流程不受影响。
+
+1. 启动时通过 `MOUNT_CALIB` 或 `--mount-calib` 指定已有
+   `handeye3d_result.json`；未指定时后端会在标定数据目录中寻找最新结果。
+2. 选择实际安装的灵巧手型号。当前安装标定固定使用六个手关节全部为 0 的模型。
+3. 7013 提供 16 个固定顺序槽位：
+   `palm-red-01..08` 对应手心红点，`back-green-01..08` 对应手背绿点。
+4. 对每个槽位，先在右侧零位手模型 mesh 上点击贴点位置，再在左侧当前 episode
+   点云中点击同编号的实体圆点。单个姿态不必看见全部 16 点，可以分多个 episode
+   采集手心和手背。
+5. 保存配对后运行安装解算。后端使用已有 `T_cam2base` 和每个 episode 的
+   `T_base_wrist`，将相机点变换到腕系，再对模型点执行刚体配准：
+
+   `inv(T_base_wrist) @ T_cam2base @ p_camera ≈ T_wrist2hand @ p_hand`
+
+结果写入 `<save_path>/mount_result.json`，并生成合并后的
+`<save_path>/handeye3d_result_mount.json`。页面显示 RMS、4×4
+`T_wrist2hand`、模型叠加和派生的指尖 `tcp_points_wrist_m`。建议至少使用
+多个姿态并覆盖手心、手背两面；拟合 RMS 建议低于 5 mm。
 
 #### 7012 图像检测与编辑（保留）
 

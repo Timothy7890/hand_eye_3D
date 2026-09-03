@@ -689,6 +689,195 @@ def leave_one_out_tool(p_camera: np.ndarray, T_wrist: np.ndarray) -> list[float]
     return errors
 
 
+# --------------- 手安装标定（已知模型点对，固定相机外参） ---------------
+
+MIN_MOUNT_POINTS = 3      # 刚体变换至少 3 个不共线的模型点
+MIN_MOUNT_POSES_LOO = 2   # 按 pose 留一验证至少要 2 个 pose
+
+
+def _mount_inputs(
+    p_hand: np.ndarray,
+    p_wrist: np.ndarray,
+    point_ids,
+    pose_ids,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[str], list[str]]:
+    p_hand = np.asarray(p_hand, dtype=float).reshape(-1, 3)
+    p_wrist = np.asarray(p_wrist, dtype=float).reshape(-1, 3)
+    point_array = np.asarray(
+        [str(v).strip() for v in np.asarray(point_ids, dtype=object).reshape(-1)],
+        dtype=object,
+    )
+    pose_array = np.asarray(
+        [str(v).strip() for v in np.asarray(pose_ids, dtype=object).reshape(-1)],
+        dtype=object,
+    )
+    n = len(p_hand)
+    if len(p_wrist) != n or len(point_array) != n or len(pose_array) != n:
+        raise ValueError(
+            "手安装标定输入数量不一致: "
+            f"hand={n}, wrist={len(p_wrist)}, point={len(point_array)}, "
+            f"pose={len(pose_array)}"
+        )
+    if not np.all(np.isfinite(p_hand)) or not np.all(np.isfinite(p_wrist)):
+        raise ValueError("点坐标包含 NaN 或无穷值")
+    if any(not value for value in point_array) or any(not value for value in pose_array):
+        raise ValueError("point_id 和 pose_id 必须是非空字符串")
+    pairs = list(zip(pose_array, point_array))
+    duplicates = [pair for pair in sorted(set(pairs)) if pairs.count(pair) > 1]
+    if duplicates:
+        raise ValueError(
+            f"同一 pose 的同一模型点只能有一个 observation: "
+            f"{duplicates[0][0]}/{duplicates[0][1]}"
+        )
+    point_names = sorted(set(point_array))
+    if len(point_names) < MIN_MOUNT_POINTS:
+        raise ValueError(
+            f"手安装标定至少需要 {MIN_MOUNT_POINTS} 个不同的模型点，"
+            f"当前 {len(point_names)} 个"
+        )
+    unique_hand = np.stack(
+        [p_hand[np.flatnonzero(point_array == name)[0]] for name in point_names]
+    )
+    if _collinearity(unique_hand) < 1e-6:
+        raise ValueError("选取的模型点几乎共线，无法唯一确定手的姿态，请增加不共线的点")
+    return (
+        p_hand,
+        p_wrist,
+        point_array,
+        pose_array,
+        point_names,
+        sorted(set(pose_array)),
+    )
+
+
+def solve_hand_mount(
+    p_hand: np.ndarray,
+    p_wrist: np.ndarray,
+    point_ids,
+    pose_ids,
+) -> dict:
+    """已知模型点对求安装变换 T_wrist2hand（腕系 ← 手基座系）。"""
+    (
+        p_hand,
+        p_wrist,
+        point_array,
+        pose_array,
+        point_names,
+        pose_names,
+    ) = _mount_inputs(p_hand, p_wrist, point_ids, pose_ids)
+
+    rigid = solve_rigid_transform(p_hand, p_wrist)
+    R = np.asarray(rigid["R_cam2base"], dtype=float)
+    t = np.asarray(rigid["t_cam2base_m"], dtype=float)
+    residual_mm = np.asarray(rigid["residual_mm"]["per_sample"], dtype=float)
+
+    by_point = {}
+    for name in point_names:
+        indices = np.flatnonzero(point_array == name)
+        stats = _residual_stats(residual_mm[indices])
+        stats["per_observation"] = residual_mm[indices].tolist()
+        by_point[name] = stats
+    by_pose = {}
+    for name in pose_names:
+        indices = np.flatnonzero(pose_array == name)
+        stats = _residual_stats(residual_mm[indices])
+        stats["per_observation"] = residual_mm[indices].tolist()
+        by_pose[name] = stats
+
+    rpy = rot_to_rpy(R)
+    return {
+        "mode": "hand_mount_known_points",
+        "num_samples": len(p_hand),
+        "point_count": len(point_names),
+        "pose_count": len(pose_names),
+        "point_ids": point_names,
+        "pose_ids": pose_names,
+        "T_wrist2hand": make_T(R, t).tolist(),
+        "R_wrist2hand": R.tolist(),
+        "t_wrist2hand_m": t.tolist(),
+        "rpy_rad": list(rpy),
+        "rpy_deg": [math.degrees(value) for value in rpy],
+        "residual_mm": {
+            "per_sample": residual_mm.tolist(),
+            **_residual_stats(residual_mm),
+        },
+        "residual_by_point_mm": by_point,
+        "residual_by_pose_mm": by_pose,
+        "collinearity": rigid["collinearity"],
+    }
+
+
+def leave_one_pose_out_mount(
+    p_hand: np.ndarray,
+    p_wrist: np.ndarray,
+    point_ids,
+    pose_ids,
+) -> dict:
+    """按 pose 留一，评估姿态变化导致的 FK/外参误差。"""
+    try:
+        (
+            p_hand,
+            p_wrist,
+            point_array,
+            pose_array,
+            _point_names,
+            pose_names,
+        ) = _mount_inputs(p_hand, p_wrist, point_ids, pose_ids)
+    except ValueError as exc:
+        return {"feasible": False, "coverage_diagnostics": [str(exc)]}
+
+    if len(pose_names) < MIN_MOUNT_POSES_LOO:
+        return {
+            "feasible": False,
+            "coverage_diagnostics": [
+                f"按 pose 留一至少需要 {MIN_MOUNT_POSES_LOO} 个 pose，"
+                f"当前 {len(pose_names)} 个"
+            ],
+        }
+
+    folds = []
+    all_errors: list[float] = []
+    diagnostics: list[str] = []
+    for pose in pose_names:
+        train = pose_array != pose
+        test = ~train
+        try:
+            fitted = solve_hand_mount(
+                p_hand[train], p_wrist[train], point_array[train], pose_array[train]
+            )
+        except ValueError as exc:
+            diagnostics.append(f"留出 pose {pose} 后不可解: {exc}")
+            continue
+        R = np.asarray(fitted["R_wrist2hand"], dtype=float)
+        t = np.asarray(fitted["t_wrist2hand_m"], dtype=float)
+        predicted = (R @ p_hand[test].T).T + t
+        errors = (
+            np.linalg.norm(predicted - p_wrist[test], axis=1) * 1000.0
+        ).tolist()
+        all_errors.extend(errors)
+        folds.append(
+            {
+                "pose_id": pose,
+                "observation_count": len(errors),
+                "residual_mm": _residual_stats(np.asarray(errors)),
+                "per_observation": errors,
+            }
+        )
+    if diagnostics or len(folds) != len(pose_names):
+        return {
+            "feasible": False,
+            "completed_fold_count": len(folds),
+            "required_fold_count": len(pose_names),
+            "coverage_diagnostics": diagnostics,
+        }
+    return {
+        "feasible": True,
+        "folds": folds,
+        "stats_mm": _residual_stats(np.asarray(all_errors)),
+        "coverage_diagnostics": [],
+    }
+
+
 def leave_one_out(p_camera: np.ndarray, p_base: np.ndarray) -> list[float]:
     """留一交叉验证：每次剔除一个点解算，再用该点评估预测误差（毫米）。
 

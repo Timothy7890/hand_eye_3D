@@ -3,6 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import * as THREE from 'three'
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
 import { PLYLoader } from 'three/addons/loaders/PLYLoader.js'
+import { STLLoader } from 'three/addons/loaders/STLLoader.js'
 
 const viewerHost = ref(null)
 const status = ref(null)
@@ -24,6 +25,37 @@ const pointSize = ref(4)
 const solveResult = ref(null)
 const imageFrontendUrl = `${window.location.protocol}//${window.location.hostname}:7012`
 
+// 手安装标定固定使用 16 个有序物理点；每个槽依次完成模型点和点云点。
+const mode = ref('marker')
+const hands = ref([])
+const selectedHandId = ref('')
+const handModel = ref(null)
+const handBusy = ref(false)
+const activeMountSlotId = ref('palm-red-01')
+const mountDrafts = ref([])
+const mountSamples = ref([])
+const mountMinPoints = ref(3)
+const mountSavedCloudPoints = ref([])
+const mountSaveBusy = ref(false)
+const mountSolveBusy = ref(false)
+const mountResult = ref(null)
+const overlayVisible = ref(false)
+const handViewerHost = ref(null)
+const mountSlots = [
+  ...Array.from({ length: 8 }, (_, index) => ({
+    point_id: `palm-red-${String(index + 1).padStart(2, '0')}`,
+    label: `手心红点 ${String(index + 1).padStart(2, '0')}`,
+    side: 'palm',
+    color: '#ef4444',
+  })),
+  ...Array.from({ length: 8 }, (_, index) => ({
+    point_id: `back-green-${String(index + 1).padStart(2, '0')}`,
+    label: `手背绿点 ${String(index + 1).padStart(2, '0')}`,
+    side: 'back',
+    color: '#22c55e',
+  })),
+]
+
 let scene
 let camera
 let renderer
@@ -34,6 +66,18 @@ let markerGroup
 let resizeObserver
 let requestSerial = 0
 let pointerStart = null
+
+let handScene
+let handCamera
+let handRenderer
+let handControls
+let handMeshGroup
+let handPointGroup
+let handResizeObserver
+let handPointerStart = null
+let handLoadSerial = 0
+let overlayGroup
+const stlCache = new Map()
 
 const currentEpisode = computed(() =>
   episodes.value.find((item) => item.name === selectedEpisode.value) || null,
@@ -46,11 +90,42 @@ const episodeSamples = computed(() =>
 const savedColors = computed(() => new Set(episodeSamples.value.map((sample) => sample.color)))
 const selectedColors = computed(() => new Set(selections.value.map((item) => item.color)))
 const selectableColors = computed(() => markerColors.value)
+const currentHand = computed(() =>
+  hands.value.find((item) => item.hand_id === selectedHandId.value) || null,
+)
+const mountSavedForEpisode = computed(() =>
+  mountSamples.value.filter((sample) => sample.pose_id === selectedEpisode.value),
+)
+const mountSamplesByPose = computed(() => {
+  const poses = new Set(mountSamples.value.map((sample) => sample.pose_id))
+  return poses.size
+})
+const mountDraftIds = computed(() => new Set(mountDrafts.value.map((item) => item.point_id)))
+const mountPairedIds = computed(() =>
+  new Set(mountDrafts.value.filter((item) => item.vertexIndex != null).map((item) => item.point_id)),
+)
+const mountSavedIds = computed(() =>
+  new Set(mountSavedForEpisode.value.map((item) => item.point_id)),
+)
+const activeMountDraft = computed(() =>
+  mountDrafts.value.find((item) => item.point_id === activeMountSlotId.value) || null,
+)
+const activeMountSlot = computed(() =>
+  mountSlots.find((item) => item.point_id === activeMountSlotId.value) || null,
+)
 const canSave = computed(() =>
   (selections.value.length > 0 || episodeSamples.value.length > 0)
   && !cloudBusy.value
   && !saveBusy.value
   && Boolean(selectedEpisode.value),
+)
+const canSaveMount = computed(() =>
+  mountDrafts.value.some((item) => item.vertexIndex != null)
+  && !cloudBusy.value
+  && !mountSaveBusy.value
+  && Boolean(selectedEpisode.value)
+  && Boolean(cloudId.value)
+  && Boolean(selectedHandId.value),
 )
 const residualSummary = computed(() => {
   const residual = solveResult.value?.residual_mm
@@ -61,6 +136,18 @@ const residualSummary = computed(() => {
     max: Number(residual.max).toFixed(2),
   }
 })
+const mountResidualSummary = computed(() => {
+  const residual = mountResult.value?.residual_mm
+  if (!residual) return null
+  return {
+    rms: Number(residual.rms).toFixed(2),
+    median: Number(residual.median).toFixed(2),
+    max: Number(residual.max).toFixed(2),
+  }
+})
+const overlayAvailable = computed(() =>
+  Boolean(mountResult.value?.per_pose_overlay_T_camera_hand?.[selectedEpisode.value]),
+)
 
 function colorInfo(color) {
   return markerColors.value.find((item) => item.color === color) || {
@@ -209,6 +296,58 @@ function restoreSavedSelections(geometry) {
   return restored.length
 }
 
+function restoreSavedMountPoints(geometry) {
+  const position = geometry?.getAttribute('position')
+  if (!position) {
+    mountSavedCloudPoints.value = []
+    return 0
+  }
+  mountSavedCloudPoints.value = mountSavedForEpisode.value
+    .filter((sample) => Array.isArray(sample.p_camera) && sample.p_camera.length === 3)
+    .map((sample) => {
+      const target = sample.p_camera.map(Number)
+      const savedCloudId = sample.cloud_id || sample.provenance?.cloud_id
+      const savedStride = Number(
+        sample.point_cloud_stride || sample.provenance?.point_cloud_stride,
+      )
+      const savedIndex = Number(sample.vertex_index ?? sample.provenance?.vertex_index)
+      let vertexIndex = -1
+      if (
+        savedCloudId === cloudId.value
+        && savedStride === cloudStride.value
+        && Number.isInteger(savedIndex)
+        && savedIndex >= 0
+        && savedIndex < position.count
+      ) {
+        vertexIndex = savedIndex
+      } else {
+        let nearestDistanceSq = Infinity
+        for (let index = 0; index < position.count; index += 1) {
+          const dx = position.getX(index) - target[0]
+          const dy = position.getY(index) - target[1]
+          const dz = position.getZ(index) - target[2]
+          const distanceSq = dx * dx + dy * dy + dz * dz
+          if (distanceSq < nearestDistanceSq) {
+            nearestDistanceSq = distanceSq
+            vertexIndex = index
+          }
+        }
+      }
+      const point = vertexIndex >= 0
+        ? [position.getX(vertexIndex), position.getY(vertexIndex), position.getZ(vertexIndex)]
+        : target
+      return {
+        ...sample,
+        vertexIndex,
+        point,
+        displayPoint: [...point],
+      }
+    })
+    .filter((item) => item.vertexIndex >= 0)
+  refreshHighlights()
+  return mountSavedCloudPoints.value.length
+}
+
 async function loadPointCloud() {
   const episode = selectedEpisode.value
   if (!episode || !renderer) return
@@ -218,6 +357,8 @@ async function loadPointCloud() {
   infoMsg.value = ''
   solveResult.value = null
   selections.value = []
+  mountDrafts.value = []
+  mountSavedCloudPoints.value = []
   cloudId.value = ''
   pointCount.value = 0
   refreshHighlights()
@@ -253,9 +394,14 @@ async function loadPointCloud() {
     cloudStride.value = Number.isFinite(stride) ? stride : cloudStride.value
     frameCloud(geometry)
     const restoredCount = restoreSavedSelections(geometry)
-    infoMsg.value = restoredCount
-      ? `已恢复 ${restoredCount} 个已保存选点，可选择颜色后重新选点`
-      : `已加载 ${pointCount.value.toLocaleString()} 个稳定点`
+    const restoredMountCount = restoreSavedMountPoints(geometry)
+    if (mode.value === 'mount' && restoredMountCount) {
+      infoMsg.value = `已恢复本姿态 ${restoredMountCount} 个安装配对点`
+    } else {
+      infoMsg.value = restoredCount
+        ? `已恢复 ${restoredCount} 个已保存选点，可选择颜色后重新选点`
+        : `已加载 ${pointCount.value.toLocaleString()} 个稳定点`
+    }
   } catch (error) {
     if (serial === requestSerial) setError(error)
   } finally {
@@ -268,7 +414,14 @@ function onPointerDown(event) {
 }
 
 function onPointerUp(event) {
-  if (!pointerStart || !cloudObject || !activeColor.value) return
+  if (!pointerStart || !cloudObject) return
+  if (mode.value === 'marker' && !activeColor.value) return
+  if (mode.value === 'mount' && !activeMountDraft.value?.p_hand) {
+    const moved = Math.hypot(event.clientX - pointerStart.x, event.clientY - pointerStart.y)
+    pointerStart = null
+    if (moved <= 5) infoMsg.value = '请先选择槽位，再在右侧零位手模型表面点击模型点'
+    return
+  }
   const moved = Math.hypot(event.clientX - pointerStart.x, event.clientY - pointerStart.y)
   pointerStart = null
   if (moved > 5) return
@@ -309,6 +462,25 @@ function onPointerUp(event) {
   const displayPoint = new THREE.Vector3(...point)
     .applyMatrix4(cloudObject.matrixWorld)
     .toArray()
+
+  if (mode.value === 'mount') {
+    const draft = activeMountDraft.value
+    mountDrafts.value = [
+      ...mountDrafts.value.filter((item) => item.point_id !== draft.point_id),
+      {
+        ...draft,
+        vertexIndex: hit.index,
+        point,
+        displayPoint,
+      },
+    ]
+    infoMsg.value = `${draft.label} 已完成配对（距点击 ${screenDistancePx.toFixed(1)} px）`
+    refreshHighlights()
+    refreshHandPointMarkers()
+    chooseNextMountSlot()
+    return
+  }
+
   const color = activeColor.value
   const next = selections.value.filter((item) => item.color !== color)
   const previous = selections.value.find((item) => item.color === color)
@@ -339,11 +511,34 @@ function refreshHighlights() {
     child.geometry?.dispose()
     child.material?.dispose()
   }
-  for (const selection of selections.value) {
-    const marker = colorInfo(selection.color)
+  const highlightItems = mode.value === 'mount'
+    ? [
+        ...mountSavedCloudPoints.value.map((selection) => ({
+          selection,
+          color: mountSlotInfo(selection.point_id).color,
+          saved: true,
+        })),
+        ...mountDrafts.value
+          .filter((selection) => selection.vertexIndex != null)
+          .map((selection) => ({
+            selection,
+            color: mountSlotInfo(selection.point_id).color,
+            saved: false,
+          })),
+      ]
+    : selections.value.map((selection) => ({
+        selection,
+        color: colorInfo(selection.color).display_color,
+        saved: false,
+      }))
+  for (const { selection, color, saved } of highlightItems) {
     const mesh = new THREE.Mesh(
-      new THREE.SphereGeometry(0.0035, 16, 12),
-      new THREE.MeshBasicMaterial({ color: marker.display_color }),
+      new THREE.SphereGeometry(saved ? 0.0032 : 0.0042, 16, 12),
+      new THREE.MeshBasicMaterial({
+        color,
+        transparent: saved,
+        opacity: saved ? 0.65 : 1,
+      }),
     )
     const displayPoint = selection.displayPoint || [
       selection.point[0],
@@ -353,6 +548,21 @@ function refreshHighlights() {
     mesh.position.fromArray(displayPoint)
     markerGroup.add(mesh)
   }
+}
+
+function mountSlotInfo(pointId) {
+  return mountSlots.find((slot) => slot.point_id === pointId) || {
+    point_id: pointId,
+    label: pointId,
+    color: '#f8fafc',
+  }
+}
+
+function chooseNextMountSlot() {
+  const next = mountSlots.find((slot) =>
+    !mountPairedIds.value.has(slot.point_id) && !mountSavedIds.value.has(slot.point_id),
+  )
+  if (next) activeMountSlotId.value = next.point_id
 }
 
 function removeSelection(color) {
@@ -365,6 +575,471 @@ function clearSelections() {
   selections.value = []
   chooseNextColor()
   refreshHighlights()
+}
+
+// ---------- 手安装标定：零位手模型与固定槽配对 ----------
+
+function matrixFromRows(rows) {
+  const matrix = new THREE.Matrix4()
+  matrix.set(
+    rows[0][0], rows[0][1], rows[0][2], rows[0][3],
+    rows[1][0], rows[1][1], rows[1][2], rows[1][3],
+    rows[2][0], rows[2][1], rows[2][2], rows[2][3],
+    rows[3][0], rows[3][1], rows[3][2], rows[3][3],
+  )
+  return matrix
+}
+
+function urdfOriginMatrix(xyz, rpy, scale) {
+  const matrix = new THREE.Matrix4()
+  matrix.compose(
+    new THREE.Vector3(...xyz),
+    new THREE.Quaternion().setFromEuler(new THREE.Euler(rpy[0], rpy[1], rpy[2], 'ZYX')),
+    new THREE.Vector3(...scale),
+  )
+  return matrix
+}
+
+function loadStl(url) {
+  if (!stlCache.has(url)) {
+    stlCache.set(
+      url,
+      new Promise((resolve, reject) => {
+        new STLLoader().load(
+          url,
+          resolve,
+          undefined,
+          () => reject(new Error(`模型加载失败: ${url}`)),
+        )
+      }),
+    )
+  }
+  return stlCache.get(url)
+}
+
+function clearGroup(group, disposeGeometry = false) {
+  if (!group) return
+  while (group.children.length) {
+    const child = group.children[0]
+    group.remove(child)
+    if (disposeGeometry) child.geometry?.dispose()
+    child.material?.dispose()
+  }
+}
+
+function initHandViewer() {
+  if (handRenderer || !handViewerHost.value) return
+  handScene = new THREE.Scene()
+  handScene.background = new THREE.Color(0x0b1220)
+  handCamera = new THREE.PerspectiveCamera(45, 1, 0.001, 10)
+  handCamera.position.set(0.22, -0.18, 0.22)
+
+  handRenderer = new THREE.WebGLRenderer({ antialias: true })
+  handRenderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
+  handRenderer.outputColorSpace = THREE.SRGBColorSpace
+  handViewerHost.value.appendChild(handRenderer.domElement)
+
+  handControls = new OrbitControls(handCamera, handRenderer.domElement)
+  handControls.enableDamping = true
+  handControls.dampingFactor = 0.08
+  handScene.add(new THREE.HemisphereLight(0xdbeafe, 0x1e293b, 1.1))
+  const keyLight = new THREE.DirectionalLight(0xffffff, 1.4)
+  keyLight.position.set(0.5, 0.8, 1)
+  handScene.add(keyLight)
+  const fillLight = new THREE.DirectionalLight(0x93c5fd, 0.5)
+  fillLight.position.set(-0.6, -0.4, -0.8)
+  handScene.add(fillLight)
+  handScene.add(new THREE.AxesHelper(0.05))
+
+  handMeshGroup = new THREE.Group()
+  handPointGroup = new THREE.Group()
+  handScene.add(handMeshGroup)
+  handScene.add(handPointGroup)
+  handRenderer.domElement.addEventListener('pointerdown', onHandPointerDown)
+  handRenderer.domElement.addEventListener('pointerup', onHandPointerUp)
+  handResizeObserver = new ResizeObserver(resizeHandViewer)
+  handResizeObserver.observe(handViewerHost.value)
+  handRenderer.setAnimationLoop(() => {
+    handControls.update()
+    handRenderer.render(handScene, handCamera)
+  })
+  resizeHandViewer()
+}
+
+function resizeHandViewer() {
+  if (!handRenderer || !handViewerHost.value) return
+  const width = Math.max(1, handViewerHost.value.clientWidth)
+  const height = Math.max(1, handViewerHost.value.clientHeight)
+  handRenderer.setSize(width, height, false)
+  handCamera.aspect = width / height
+  handCamera.updateProjectionMatrix()
+}
+
+function frameHandModel() {
+  const box = new THREE.Box3().setFromObject(handMeshGroup)
+  if (box.isEmpty()) return
+  const center = box.getCenter(new THREE.Vector3())
+  const radius = Math.max(box.getSize(new THREE.Vector3()).length() / 2, 0.06)
+  handControls.target.copy(center)
+  handCamera.position.set(
+    center.x + radius * 1.6,
+    center.y - radius * 1.2,
+    center.z + radius * 1.6,
+  )
+  handCamera.near = radius / 100
+  handCamera.far = radius * 50
+  handCamera.updateProjectionMatrix()
+  handControls.update()
+}
+
+function refreshHandPointMarkers() {
+  clearGroup(handPointGroup, true)
+  if (!handModel.value) return
+  const saved = mountSavedForEpisode.value.filter(
+    (sample) => sample.hand_id === selectedHandId.value && Array.isArray(sample.p_hand),
+  )
+  const byId = new Map(saved.map((item) => [item.point_id, { ...item, saved: true }]))
+  for (const draft of mountDrafts.value) {
+    if (draft.p_hand) byId.set(draft.point_id, { ...draft, saved: false })
+  }
+  for (const item of byId.values()) {
+    const active = activeMountSlotId.value === item.point_id
+    const paired = item.saved || item.vertexIndex != null
+    const mesh = new THREE.Mesh(
+      new THREE.SphereGeometry(active ? 0.0055 : 0.004, 16, 12),
+      new THREE.MeshBasicMaterial({
+        color: active ? '#fbbf24' : paired ? mountSlotInfo(item.point_id).color : '#e2e8f0',
+      }),
+    )
+    mesh.position.fromArray(item.p_hand)
+    handPointGroup.add(mesh)
+  }
+}
+
+async function loadHandModel() {
+  if (!selectedHandId.value || !handRenderer) return
+  const serial = ++handLoadSerial
+  handBusy.value = true
+  errorMsg.value = ''
+  try {
+    // 不传 joints，后端固定返回全零关节模型。
+    const response = await fetch(`/api/hands/${encodeURIComponent(selectedHandId.value)}/model`)
+    if (!response.ok) throw await responseError(response, '手模型加载失败')
+    const payload = await response.json()
+    const meshes = []
+    for (const link of payload.links || []) {
+      const THandLink = matrixFromRows(link.T_hand_link)
+      for (const visual of link.visuals || []) {
+        const geometry = await loadStl(visual.mesh_url)
+        meshes.push({
+          geometry,
+          link: link.link,
+          THandLink,
+          matrix: THandLink.clone().multiply(
+            urdfOriginMatrix(visual.xyz, visual.rpy, visual.scale),
+          ),
+        })
+      }
+    }
+    if (serial !== handLoadSerial) return
+    handModel.value = payload
+    mountDrafts.value = []
+    mountResult.value = null
+    overlayVisible.value = false
+    clearGroup(handMeshGroup)
+    for (const item of meshes) {
+      const mesh = new THREE.Mesh(
+        item.geometry,
+        new THREE.MeshStandardMaterial({
+          color: 0x94a3b8,
+          metalness: 0.15,
+          roughness: 0.6,
+        }),
+      )
+      mesh.matrixAutoUpdate = false
+      mesh.matrix.copy(item.matrix)
+      mesh.userData.link = item.link
+      mesh.userData.THandLink = item.THandLink
+      handMeshGroup.add(mesh)
+    }
+    clearOverlay()
+    refreshHighlights()
+    refreshHandPointMarkers()
+    frameHandModel()
+    infoMsg.value = `${payload.label} 全零关节模型已加载`
+  } catch (error) {
+    if (serial === handLoadSerial) setError(error)
+  } finally {
+    if (serial === handLoadSerial) handBusy.value = false
+  }
+}
+
+function activateMountSlot(pointId) {
+  activeMountSlotId.value = pointId
+  const draft = mountDrafts.value.find((item) => item.point_id === pointId)
+  if (draft?.p_hand && draft.vertexIndex == null) {
+    infoMsg.value = `${draft.label} 已有模型点，请在点云点击同序实体点`
+  } else if (draft?.vertexIndex != null || mountSavedIds.value.has(pointId)) {
+    infoMsg.value = `${mountSlotInfo(pointId).label} 已完成；可重新点击模型和点云后覆盖`
+  } else {
+    infoMsg.value = `当前槽：${mountSlotInfo(pointId).label}，请先点击零位手模型表面`
+  }
+  refreshHandPointMarkers()
+}
+
+function onHandPointerDown(event) {
+  handPointerStart = { x: event.clientX, y: event.clientY }
+}
+
+function onHandPointerUp(event) {
+  if (!handPointerStart || !handMeshGroup || !activeMountSlot.value) return
+  const moved = Math.hypot(
+    event.clientX - handPointerStart.x,
+    event.clientY - handPointerStart.y,
+  )
+  handPointerStart = null
+  if (moved > 5) return
+
+  const rect = handRenderer.domElement.getBoundingClientRect()
+  const mouse = new THREE.Vector2(
+    ((event.clientX - rect.left) / rect.width) * 2 - 1,
+    -((event.clientY - rect.top) / rect.height) * 2 + 1,
+  )
+  const raycaster = new THREE.Raycaster()
+  raycaster.setFromCamera(mouse, handCamera)
+  const hit = raycaster.intersectObjects(handMeshGroup.children, false)[0]
+  if (!hit) {
+    infoMsg.value = '没有命中手模型 mesh，请旋转或放大后重试'
+    return
+  }
+
+  const slot = activeMountSlot.value
+  const pHand = hit.point.clone()
+  const pLocal = pHand.clone().applyMatrix4(
+    hit.object.userData.THandLink.clone().invert(),
+  )
+  mountDrafts.value = [
+    ...mountDrafts.value.filter((item) => item.point_id !== slot.point_id),
+    {
+      ...slot,
+      link: hit.object.userData.link,
+      p_local: pLocal.toArray(),
+      p_hand: pHand.toArray(),
+      meshFaceIndex: hit.faceIndex,
+    },
+  ]
+  infoMsg.value = `${slot.label} 模型点已选，请在当前 episode 点云点击同序实体点`
+  refreshHighlights()
+  refreshHandPointMarkers()
+}
+
+function removeMountDraft(pointId) {
+  mountDrafts.value = mountDrafts.value.filter((item) => item.point_id !== pointId)
+  activeMountSlotId.value = pointId
+  refreshHighlights()
+  refreshHandPointMarkers()
+}
+
+function clearMountDrafts() {
+  mountDrafts.value = []
+  refreshHighlights()
+  refreshHandPointMarkers()
+}
+
+async function loadHandsCatalog() {
+  const response = await fetch('/api/hands')
+  if (!response.ok) throw await responseError(response, '手型号目录加载失败')
+  const data = await response.json()
+  hands.value = data.hands || []
+  if (!hands.value.some((item) => item.hand_id === selectedHandId.value)) {
+    const savedHandId = mountSamples.value[0]?.hand_id
+    selectedHandId.value = hands.value.find((item) => item.hand_id === savedHandId)?.hand_id
+      || hands.value[0]?.hand_id
+      || ''
+  }
+}
+
+async function refreshMountSamples() {
+  const response = await fetch('/api/mount/samples')
+  if (!response.ok) throw await responseError(response, '安装样本加载失败')
+  const data = await response.json()
+  mountSamples.value = data.samples || []
+  mountMinPoints.value = Number(data.min_points) || 3
+  if (cloudObject) restoreSavedMountPoints(cloudObject.geometry)
+  refreshHandPointMarkers()
+}
+
+async function saveMountSelections() {
+  if (!canSaveMount.value) return
+  mountSaveBusy.value = true
+  errorMsg.value = ''
+  infoMsg.value = ''
+  try {
+    const paired = mountDrafts.value.filter((item) => item.vertexIndex != null)
+    const confirmResponse = await fetch('/api/offline/confirm-mount-points', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        episode: selectedEpisode.value,
+        cloud_id: cloudId.value,
+        stride: cloudStride.value,
+        hand_id: selectedHandId.value,
+        hand_joints: (handModel.value?.actuated_joints || []).map(() => 0),
+        selections: paired.map((item) => ({
+          point_id: item.point_id,
+          label: item.label,
+          link: item.link,
+          p_local: item.p_local,
+          p_hand: item.p_hand,
+          vertex_index: item.vertexIndex,
+        })),
+      }),
+    })
+    if (!confirmResponse.ok) throw await responseError(confirmResponse, '安装选点确认失败')
+    const confirmation = await confirmResponse.json()
+
+    // mount API 不提供 replace_existing；对本 episode 同槽重选时先删除旧记录。
+    const pairedIds = new Set(paired.map((item) => item.point_id))
+    const replaced = mountSavedForEpisode.value.filter((item) => pairedIds.has(item.point_id))
+    await Promise.all(replaced.map(async (item) => {
+      const response = await fetch(`/api/mount/samples/${item.index}`, { method: 'DELETE' })
+      if (!response.ok) throw await responseError(response, `替换 ${item.point_id} 失败`)
+    }))
+
+    const saveResponse = await fetch('/api/mount/samples/batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ observations: confirmation.observations }),
+    })
+    if (!saveResponse.ok) throw await responseError(saveResponse, '安装样本保存失败')
+    const saved = await saveResponse.json()
+    mountDrafts.value = []
+    mountResult.value = null
+    overlayVisible.value = false
+    clearOverlay()
+    await refreshMountSamples()
+    chooseNextMountSlot()
+    refreshHighlights()
+    infoMsg.value = `已保存 ${saved.saved_count} 个安装配对，本会话共 ${saved.count} 条`
+  } catch (error) {
+    setError(error)
+  } finally {
+    mountSaveBusy.value = false
+  }
+}
+
+async function deleteMountSample(index) {
+  try {
+    const response = await fetch(`/api/mount/samples/${index}`, { method: 'DELETE' })
+    if (!response.ok) throw await responseError(response, '安装样本删除失败')
+    mountResult.value = null
+    overlayVisible.value = false
+    clearOverlay()
+    await refreshMountSamples()
+    refreshHighlights()
+    infoMsg.value = '安装样本已删除，可重新采集该槽'
+  } catch (error) {
+    setError(error)
+  }
+}
+
+async function solveMount() {
+  mountSolveBusy.value = true
+  errorMsg.value = ''
+  infoMsg.value = ''
+  try {
+    const response = await fetch('/api/mount/solve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    })
+    if (!response.ok) throw await responseError(response, '手安装解算失败')
+    mountResult.value = await response.json()
+    infoMsg.value = '手安装解算完成'
+    clearOverlay()
+    if (overlayVisible.value) buildOverlay()
+  } catch (error) {
+    setError(error)
+  } finally {
+    mountSolveBusy.value = false
+  }
+}
+
+function ensureOverlayGroup() {
+  if (overlayGroup || !scene) return
+  overlayGroup = new THREE.Group()
+  overlayGroup.matrixAutoUpdate = false
+  scene.add(overlayGroup)
+}
+
+function clearOverlay() {
+  if (!overlayGroup) return
+  clearGroup(overlayGroup)
+  overlayGroup.visible = false
+}
+
+function buildOverlay() {
+  if (!handMeshGroup?.children.length || !overlayAvailable.value) return
+  ensureOverlayGroup()
+  clearGroup(overlayGroup)
+  for (const source of handMeshGroup.children) {
+    const mesh = new THREE.Mesh(
+      source.geometry,
+      new THREE.MeshBasicMaterial({
+        color: 0x38d996,
+        transparent: true,
+        opacity: 0.42,
+        depthWrite: false,
+      }),
+    )
+    mesh.matrixAutoUpdate = false
+    mesh.matrix.copy(source.matrix)
+    overlayGroup.add(mesh)
+  }
+  updateOverlay()
+}
+
+function updateOverlay() {
+  if (!overlayGroup) return
+  const rows = mountResult.value?.per_pose_overlay_T_camera_hand?.[selectedEpisode.value]
+  overlayGroup.visible = Boolean(rows && overlayVisible.value)
+  if (rows) overlayGroup.matrix.copy(matrixFromRows(rows))
+}
+
+function toggleOverlay() {
+  overlayVisible.value = !overlayVisible.value
+  if (overlayVisible.value && overlayAvailable.value && !overlayGroup?.children.length) {
+    buildOverlay()
+  }
+  if (overlayVisible.value && !overlayAvailable.value) {
+    infoMsg.value = '当前 episode 未参与本次解算，没有模型叠加位姿'
+  }
+  updateOverlay()
+}
+
+function formatMatrixValue(value) {
+  return Number(value).toFixed(6)
+}
+
+async function setMode(nextMode) {
+  if (mode.value === nextMode) return
+  mode.value = nextMode
+  refreshHighlights()
+  if (nextMode !== 'mount') {
+    if (overlayGroup) overlayGroup.visible = false
+    return
+  }
+  await nextTick()
+  initHandViewer()
+  try {
+    if (!mountSamples.value.length) await refreshMountSamples()
+    if (!hands.value.length) await loadHandsCatalog()
+    if (selectedHandId.value && !handModel.value) await loadHandModel()
+    restoreSavedMountPoints(cloudObject?.geometry)
+    refreshHighlights()
+  } catch (error) {
+    setError(error)
+  }
 }
 
 async function loadWorkspace() {
@@ -412,6 +1087,8 @@ async function selectEpisode(name) {
   activeColor.value = episodeSamples.value[0]?.color || selectableColors.value[0]?.color || ''
   await nextTick()
   await loadPointCloud()
+  refreshHandPointMarkers()
+  updateOverlay()
 }
 
 async function confirmAndSave() {
@@ -500,6 +1177,12 @@ watch(cloudStride, async (value, oldValue) => {
   if (value !== oldValue && selectedEpisode.value && renderer) await loadPointCloud()
 })
 
+watch(selectedHandId, async (value, oldValue) => {
+  if (value && value !== oldValue && mode.value === 'mount' && handRenderer) {
+    await loadHandModel()
+  }
+})
+
 onMounted(async () => {
   initViewer()
   await loadWorkspace()
@@ -508,7 +1191,9 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   requestSerial += 1
+  handLoadSerial += 1
   resizeObserver?.disconnect()
+  handResizeObserver?.disconnect()
   if (renderer) {
     renderer.setAnimationLoop(null)
     renderer.domElement.removeEventListener('pointerdown', onPointerDown)
@@ -516,6 +1201,19 @@ onBeforeUnmount(() => {
     renderer.dispose()
   }
   controls?.dispose()
+  if (handRenderer) {
+    handRenderer.setAnimationLoop(null)
+    handRenderer.domElement.removeEventListener('pointerdown', onHandPointerDown)
+    handRenderer.domElement.removeEventListener('pointerup', onHandPointerUp)
+    handRenderer.dispose()
+  }
+  handControls?.dispose()
+  clearGroup(handMeshGroup)
+  clearGroup(handPointGroup, true)
+  clearOverlay()
+  for (const geometryPromise of stlCache.values()) {
+    geometryPromise.then((geometry) => geometry.dispose()).catch(() => {})
+  }
   disposeCloud()
 })
 </script>
@@ -602,6 +1300,221 @@ onBeforeUnmount(() => {
       </section>
 
       <aside class="selection-panel">
+        <div class="mode-tabs">
+          <button :class="{ active: mode === 'marker' }" @click="setMode('marker')">
+            Marker 标定
+          </button>
+          <button :class="{ active: mode === 'mount' }" @click="setMode('mount')">
+            手安装标定
+          </button>
+        </div>
+
+        <template v-if="mode === 'mount'">
+          <section class="side-card">
+            <div class="panel-heading compact">
+              <div>
+                <h2>1. 选择零位手模型</h2>
+                <span>仅加载全零关节 · mesh 表面可点击</span>
+              </div>
+              <span class="zero-badge">6 DOF = 0</span>
+            </div>
+            <select v-model="selectedHandId" class="hand-select" :disabled="handBusy">
+              <option v-for="hand in hands" :key="hand.hand_id" :value="hand.hand_id">
+                {{ hand.label }}（{{ hand.side === 'left' ? '左手' : '右手' }}）
+              </option>
+            </select>
+            <div ref="handViewerHost" class="hand-viewer">
+              <div v-if="handBusy" class="viewer-overlay">
+                <span class="spinner"></span>
+                正在加载手模型…
+              </div>
+              <div class="hand-viewer-help">先选槽，再单击 mesh · 拖动旋转 · 滚轮缩放</div>
+            </div>
+            <p class="model-meta">
+              {{ currentHand?.vendor || '—' }} · {{ handModel?.base_link || '等待模型' }}
+            </p>
+          </section>
+
+          <section class="side-card mount-slots-card">
+            <div class="panel-heading compact">
+              <div>
+                <h2>2. 依次配对 16 个有序槽</h2>
+                <span>手心红点 01–08 · 手背绿点 01–08</span>
+              </div>
+            </div>
+            <div class="mount-slot-section">
+              <strong>手心</strong>
+              <div class="mount-slot-grid">
+                <button
+                  v-for="slot in mountSlots.slice(0, 8)"
+                  :key="slot.point_id"
+                  class="mount-slot"
+                  :class="{
+                    active: activeMountSlotId === slot.point_id,
+                    modeled: mountDraftIds.has(slot.point_id),
+                    paired: mountPairedIds.has(slot.point_id),
+                    saved: mountSavedIds.has(slot.point_id),
+                  }"
+                  @click="activateMountSlot(slot.point_id)"
+                >
+                  <i :style="{ background: slot.color }"></i>
+                  <span>{{ slot.point_id }}</span>
+                  <small v-if="mountPairedIds.has(slot.point_id)">待保存</small>
+                  <small v-else-if="mountSavedIds.has(slot.point_id)">已保存</small>
+                  <small v-else-if="mountDraftIds.has(slot.point_id)">点云待选</small>
+                  <small v-else>模型待选</small>
+                </button>
+              </div>
+            </div>
+            <div class="mount-slot-section">
+              <strong>手背</strong>
+              <div class="mount-slot-grid">
+                <button
+                  v-for="slot in mountSlots.slice(8)"
+                  :key="slot.point_id"
+                  class="mount-slot"
+                  :class="{
+                    active: activeMountSlotId === slot.point_id,
+                    modeled: mountDraftIds.has(slot.point_id),
+                    paired: mountPairedIds.has(slot.point_id),
+                    saved: mountSavedIds.has(slot.point_id),
+                  }"
+                  @click="activateMountSlot(slot.point_id)"
+                >
+                  <i :style="{ background: slot.color }"></i>
+                  <span>{{ slot.point_id }}</span>
+                  <small v-if="mountPairedIds.has(slot.point_id)">待保存</small>
+                  <small v-else-if="mountSavedIds.has(slot.point_id)">已保存</small>
+                  <small v-else-if="mountDraftIds.has(slot.point_id)">点云待选</small>
+                  <small v-else>模型待选</small>
+                </button>
+              </div>
+            </div>
+            <p class="armed-hint">
+              当前：<strong>{{ activeMountSlot?.label }}</strong>
+              <template v-if="activeMountDraft?.p_hand && activeMountDraft?.vertexIndex == null">
+                → 模型点已选，请点击当前 episode 点云
+              </template>
+              <template v-else>→ 请先点击模型 mesh，再点击点云</template>
+            </p>
+          </section>
+
+          <section class="side-card grow">
+            <div class="panel-heading compact">
+              <div>
+                <h2>3. 本姿态待保存配对</h2>
+                <span>
+                  {{ mountPairedIds.size }} 对待保存 · {{ mountSavedForEpisode.length }} 对已保存
+                </span>
+              </div>
+              <button class="text-button" :disabled="!mountDrafts.length" @click="clearMountDrafts">
+                撤销全部
+              </button>
+            </div>
+            <div class="selection-list mount-selection-list">
+              <article
+                v-for="item in mountDrafts"
+                :key="item.point_id"
+                class="selection-row"
+              >
+                <i :style="{ background: item.color }"></i>
+                <div>
+                  <strong>{{ item.label }}</strong>
+                  <code v-if="item.point">
+                    cloud {{ item.point.map((value) => Number(value).toFixed(4)).join(', ') }}
+                  </code>
+                  <code>model {{ item.p_hand.map((value) => Number(value).toFixed(4)).join(', ') }}</code>
+                  <small>
+                    {{ item.link }} ·
+                    {{ item.vertexIndex == null ? '等待点云点' : `cloud vertex #${item.vertexIndex}` }}
+                  </small>
+                </div>
+                <button title="撤销此槽" @click="removeMountDraft(item.point_id)">×</button>
+              </article>
+              <p v-if="!mountDrafts.length" class="empty-state">
+                每个槽都要先在零位手模型 mesh 上点击，再在点云点击同序实体点。
+                单个 episode 不必看到全部 16 点。
+              </p>
+            </div>
+            <button class="primary-button" :disabled="!canSaveMount" @click="saveMountSelections">
+              {{ mountSaveBusy ? '确认并保存中…' : '确认并保存本姿态配对' }}
+            </button>
+          </section>
+
+          <section class="side-card mount-samples-card">
+            <div class="panel-heading compact">
+              <div>
+                <h2>4. 安装样本与解算</h2>
+                <span>{{ mountSamples.length }} 条样本 · {{ mountSamplesByPose }} 个姿态</span>
+              </div>
+            </div>
+            <div v-if="mountSavedForEpisode.length" class="mount-sample-list">
+              <div
+                v-for="sample in mountSavedForEpisode"
+                :key="sample.index"
+                class="mount-sample-row"
+              >
+                <i :style="{ background: mountSlotInfo(sample.point_id).color }"></i>
+                <span>{{ sample.label || mountSlotInfo(sample.point_id).label }}</span>
+                <small>#{{ sample.index }}</small>
+                <button
+                  class="mini-delete"
+                  :title="`删除 ${sample.point_id}`"
+                  @click="deleteMountSample(sample.index)"
+                >×</button>
+              </div>
+            </div>
+            <p v-else class="episode-sample-hint">当前 episode 尚无已保存安装样本</p>
+            <button
+              class="solve-button"
+              :disabled="mountSolveBusy || mountSamples.length < mountMinPoints"
+              @click="solveMount"
+            >
+              {{ mountSolveBusy ? '解算中…' : `解算 T_wrist2hand（至少 ${mountMinPoints} 点）` }}
+            </button>
+            <div v-if="mountResidualSummary" class="result-summary">
+              <div><span>RMS</span><strong>{{ mountResidualSummary.rms }} mm</strong></div>
+              <div><span>Median</span><strong>{{ mountResidualSummary.median }} mm</strong></div>
+              <div><span>Max</span><strong>{{ mountResidualSummary.max }} mm</strong></div>
+            </div>
+            <button
+              v-if="mountResult"
+              class="secondary-button overlay-toggle"
+              :disabled="!overlayAvailable"
+              @click="toggleOverlay"
+            >
+              {{ overlayVisible ? '隐藏' : '显示' }}当前姿态模型叠加
+            </button>
+          </section>
+
+          <section v-if="mountResult" class="side-card mount-result-card">
+            <h2>解算输出</h2>
+            <div class="matrix-block">
+              <span>T_wrist2hand</span>
+              <code
+                v-for="(row, rowIndex) in mountResult.T_wrist2hand"
+                :key="rowIndex"
+              >{{ row.map(formatMatrixValue).join('  ') }}</code>
+            </div>
+            <div class="result-paths">
+              <span>输出</span>
+              <code>{{ mountResult.saved_to }}</code>
+              <code v-if="mountResult.merged_calib">{{ mountResult.merged_calib }}</code>
+            </div>
+            <div class="tcp-list">
+              <span>tcp_points（腕系，m）</span>
+              <div
+                v-for="tcp in mountResult.tcp_points_wrist_m"
+                :key="tcp.id"
+              >
+                <strong>{{ tcp.label }}</strong>
+                <code>{{ tcp.p_wrist_m.map((value) => Number(value).toFixed(6)).join(', ') }}</code>
+              </div>
+            </div>
+          </section>
+        </template>
+
+        <template v-else>
         <section class="side-card">
           <div class="panel-heading compact">
             <div>
@@ -679,6 +1592,7 @@ onBeforeUnmount(() => {
           </div>
           <p v-if="solveResult?.saved_to" class="saved-path">{{ solveResult.saved_to }}</p>
         </section>
+        </template>
       </aside>
     </section>
   </main>
