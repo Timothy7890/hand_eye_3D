@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 启动离线多颜色手眼标定：7012 图像编辑 + 7013 点云选点。
+# 兼容入口：只读取已有 episode，不连接相机或机器人。
+# 日常实时采集和点云处理请直接使用 ./start.sh。
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

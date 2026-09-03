@@ -105,12 +105,29 @@ cd frontend && npm run dev:pointcloud      # http://<IP>:7013 点云版
 > 与现有控制程序并存不会引起抢占/抽搐。摆位姿用你现有的控制方式。
 > 默认相机模式也只订阅 teleimager ZMQ，不会启动 SDK 或直接打开 USB 相机。
 
-### 导入 eai-teleop-studio 离线采集数据
+### 7012 实时采集 + 7013 episode 处理（推荐）
+
+```bash
+./start.sh
+```
+
+默认启动方式同时提供两个页面，并共用 `teleop_data/biaoding`：
+
+- `http://<IP>:7012` 连接实时 RGB-D 和 H2 位姿；摆好姿态后按 `C`，保存一组
+  `episode_*`。
+- `http://<IP>:7013` 只读取已经完整落盘的 episode。7012 完成采集后在 7013
+  点击刷新，即可生成点云并选点。
+- 目录还没有 episode 时，7013 会提示先去 7012 采集，不再要求
+  `--teleop-task-dir`。
+
+可用 `--record-task-dir /path/to/task` 修改两者共用的数据目录。
+
+### 纯离线导入已有 episode（兼容入口）
 
 本项目可以直接读取 eai-teleop-studio 的手眼标定任务目录：
 
 ```bash
-# 推荐：使用项目内默认目录
+# 不连接相机或机器人，只处理项目内已有数据
 ./start_multicolor_calibration.sh
 
 # 等价的完整调用
@@ -120,7 +137,7 @@ cd frontend && npm run dev:pointcloud      # http://<IP>:7013 点云版
   --no-timestamp-dir
 ```
 
-专用脚本默认读取 `teleop_data/biaoding`，使用
+兼容脚本默认读取 `teleop_data/biaoding`，使用
 `config/camera/orbbec_rgbd_calibration.json`，并固定写入
 `handeye3d_data/biaoding`。也可通过环境变量覆盖：
 
@@ -165,8 +182,8 @@ episode 的每种 canonical color 仍然只能保存一个观测。
 2. 选择实际安装的灵巧手型号。当前安装标定固定使用六个手关节全部为 0 的模型。
 3. 7013 提供 16 个固定顺序槽位：
    `palm-red-01..08` 对应手心红点，`back-green-01..08` 对应手背绿点。
-4. 对每个槽位，先在右侧零位手模型 mesh 上点击贴点位置，再在左侧当前 episode
-   点云中点击同编号的实体圆点。单个姿态不必看见全部 16 点，可以分多个 episode
+4. 对每个槽位，先在中央「零位手模型」页点击贴点位置，再切换到中央「实体点云」
+   页点击同编号圆点。单个姿态不必看见全部 16 点，可以分多个 episode
    采集手心和手背。
 5. 保存配对后运行安装解算。后端使用已有 `T_cam2base` 和每个 episode 的
    `T_base_wrist`，将相机点变换到腕系，再对模型点执行刚体配准：

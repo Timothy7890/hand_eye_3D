@@ -1055,6 +1055,7 @@ async function setMode(nextMode) {
 
 async function loadWorkspace() {
   errorMsg.value = ''
+  infoMsg.value = ''
   try {
     const [statusResponse, episodesResponse, colorsResponse, samplesResponse] = await Promise.all([
       fetch('/api/status'),
@@ -1076,8 +1077,8 @@ async function loadWorkspace() {
       colorsResponse.json(),
       samplesResponse.json(),
     ])
-    if (statusData.mode !== 'offline') {
-      throw new Error('7013 点云页面只支持 --teleop-task-dir 离线模式')
+    if (!statusData.offline?.enabled) {
+      throw new Error('后端未配置可读取的 episode 目录')
     }
     status.value = statusData
     episodes.value = episodeData.episodes || []
@@ -1087,6 +1088,9 @@ async function loadWorkspace() {
       selectedEpisode.value = episodes.value[0]?.name || ''
     }
     activeColor.value = episodeSamples.value[0]?.color || selectableColors.value[0]?.color || ''
+    if (!episodes.value.length) {
+      infoMsg.value = '暂无 episode，请先在 7012 按 C 采集当前姿态，再点此页面的刷新按钮。'
+    }
   } catch (error) {
     setError(error)
   }
@@ -1241,11 +1245,15 @@ onBeforeUnmount(() => {
     <header class="topbar">
       <div>
         <h1>Hand-Eye 3D · 点云选点</h1>
-        <p>离线 episode · 相机系 X 右 / Y 下 / Z 前 · 单位 m</p>
+        <p>已落盘 episode · 相机系 X 右 / Y 下 / Z 前 · 单位 m</p>
       </div>
       <div class="topbar-status">
-        <span class="status-dot" :class="{ ready: status?.mode === 'offline' }"></span>
-        {{ status?.mode === 'offline' ? '离线后端已连接' : '等待后端' }}
+        <span class="status-dot" :class="{ ready: status?.offline?.enabled }"></span>
+        {{
+          status?.offline?.enabled
+            ? (status.mode === 'live' ? '实时采集 + episode 读取已连接' : '纯离线后端已连接')
+            : '等待 episode 后端'
+        }}
         <a :href="imageFrontendUrl">打开 7012 图像版</a>
       </div>
     </header>
@@ -1274,7 +1282,9 @@ onBeforeUnmount(() => {
               ⚠ {{ episode.warnings[0] }}
             </small>
           </button>
-          <p v-if="!episodes.length" class="empty-state">没有可用 episode</p>
+          <p v-if="!episodes.length" class="empty-state">
+            暂无 episode。请先在 7012 按 C 采集当前姿态，再点击上方刷新。
+          </p>
         </div>
       </aside>
 

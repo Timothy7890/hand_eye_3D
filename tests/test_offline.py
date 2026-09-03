@@ -99,6 +99,7 @@ def _write_episode(
     *,
     dtype=np.uint16,
     camera_serial: str = "TEST",
+    arm: str = "right",
 ) -> Path:
     root = task_dir / name
     (root / "rgb").mkdir(parents=True)
@@ -117,7 +118,7 @@ def _write_episode(
                 "idx": index,
                 "colors": {"head_rgb": f"rgb/{index:06d}_head_rgb.jpg"},
                 "depths": {"head_depth": f"depth/{index:06d}_head_depth.npy"},
-                "states": {"right_arm": {"qpos": [index * 0.01] * 7}},
+                "states": {f"{arm}_arm": {"qpos": [index * 0.01] * 7}},
                 "timestamps": {"sample_timestamp_ns": 1000 + index},
                 "rgbd": {
                     "color_shape": [3, 4],
@@ -135,14 +136,9 @@ def _write_episode(
             "frame_count": len(rows),
             "robot": "H2",
             "camera_serial": camera_serial,
-            "right_arm_joint_order": [
-                "right_shoulder_pitch",
-                "right_shoulder_roll",
-                "right_shoulder_yaw",
-                "right_elbow",
-                "right_wrist_roll",
-                "right_wrist_pitch",
-                "right_wrist_yaw",
+            f"{arm}_arm_joint_order": [
+                name.replace("right_", f"{arm}_", 1)
+                for name in RIGHT_ARM_TEST_JOINTS
             ],
         },
         "data": rows,
@@ -211,6 +207,22 @@ class OfflineEpisodeBackendTest(unittest.TestCase):
         pick = backend.pick("episode_0006", 2, 1)
         self.assertTrue(pick["warnings"])
         self.assertEqual(pick["p_camera"][2], 1.0)
+
+    def test_left_arm_episode_backend_uses_left_dataset_schema(self):
+        _write_episode(
+            self.root,
+            "episode_0007",
+            [980, 1000, 1020, 1010, 990],
+            arm="left",
+        )
+        backend = OfflineEpisodeBackend(
+            self.root, self.calibration_path, arm="left"
+        )
+
+        result = backend.pick("episode_0007", 2, 1)
+        self.assertEqual(backend.arm, "left")
+        self.assertIn("left_arm_q_median", result)
+        self.assertNotIn("right_arm_q_median", result)
 
     def test_rejects_unstable_depth(self):
         _write_episode(
@@ -412,15 +424,17 @@ class SampleProvenanceTest(unittest.TestCase):
 
 
 class OrphanedOfflineSamplesTest(unittest.TestCase):
-    def test_deleted_episode_samples_are_excluded(self):
+    def test_deleted_episode_samples_are_excluded_with_live_episode_backend(self):
         from backend import app as app_module
 
         old_save_path = app_module.save_path
         old_offline_backend = app_module.offline_backend
+        old_episode_backend = app_module.episode_backend
         with tempfile.TemporaryDirectory() as tempdir:
             try:
                 app_module.save_path = Path(tempdir)
-                app_module.offline_backend = SimpleNamespace(
+                app_module.offline_backend = None
+                app_module.episode_backend = SimpleNamespace(
                     episode_names=lambda: {"episode_0001"}
                 )
                 app_module.init_state()
@@ -439,6 +453,7 @@ class OrphanedOfflineSamplesTest(unittest.TestCase):
             finally:
                 app_module.save_path = old_save_path
                 app_module.offline_backend = old_offline_backend
+                app_module.episode_backend = old_episode_backend
 
 
 class BatchSampleApiTest(unittest.TestCase):

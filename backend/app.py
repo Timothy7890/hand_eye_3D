@@ -62,6 +62,7 @@ arm_lock = threading.Lock()
 arm_side: str = "right"
 save_path: Path = Path("./handeye3d_data")
 offline_backend: OfflineEpisodeBackend | None = None
+episode_backend: OfflineEpisodeBackend | None = None
 teleop_task_dir: Path | None = None
 record_task_dir: Path | None = None
 rgbd_calib_path: Path = DEFAULT_RGBD_CALIB_PATH
@@ -99,6 +100,11 @@ def _pivot_dir() -> Path:
     return save_path / "pivot_samples"
 
 
+def _available_episode_backend() -> OfflineEpisodeBackend | None:
+    """返回 episode 读取器；纯离线模式优先，兼容直接注入 offline_backend。"""
+    return offline_backend if offline_backend is not None else episode_backend
+
+
 def _load_samples() -> list[dict]:
     items = []
     for f in sorted(_samples_dir().glob("*.json")):
@@ -106,8 +112,9 @@ def _load_samples() -> list[dict]:
             items.append(json.loads(f.read_text()))
         except (OSError, json.JSONDecodeError):
             continue
-    if offline_backend is not None:
-        episode_names = getattr(offline_backend, "episode_names", None)
+    backend = _available_episode_backend()
+    if backend is not None:
+        episode_names = getattr(backend, "episode_names", None)
         if callable(episode_names):
             active = episode_names()
             items = [
@@ -229,6 +236,12 @@ async def get_capability_hint() -> dict:
 
 @app.get("/api/status")
 async def api_status():
+    browsing_backend = _available_episode_backend()
+    browsing_task_dir = (
+        getattr(browsing_backend, "task_dir", None)
+        if browsing_backend is not None
+        else None
+    )
     return {
         "mode": "offline" if offline_backend is not None else "live",
         "camera": _active_camera_info(),
@@ -256,8 +269,19 @@ async def api_status():
             "frame_count": 5,
         },
         "offline": {
-            "enabled": offline_backend is not None,
+            "enabled": browsing_backend is not None,
             "teleop_task_dir": str(teleop_task_dir) if teleop_task_dir else None,
+            "task_dir": (
+                str(browsing_task_dir) if browsing_task_dir is not None else None
+            ),
+            "episode_task_dir": (
+                str(browsing_task_dir) if browsing_task_dir is not None else None
+            ),
+            "source": (
+                "teleop_task_dir"
+                if offline_backend is not None
+                else ("record_task_dir" if browsing_backend is not None else None)
+            ),
             "rgbd_calib": str(rgbd_calib_path),
             "serial_mismatch_policy": "warning",
         },
@@ -701,12 +725,13 @@ async def api_pick(body: dict):
 
 @app.get("/api/offline/episodes")
 async def api_offline_episodes():
-    if offline_backend is None:
+    backend = _available_episode_backend()
+    if backend is None:
         return JSONResponse(
-            {"ok": False, "error": "未配置离线遥操作任务目录，请用 --teleop-task-dir 启动"},
+            {"ok": False, "error": "未配置可读取的 episode 任务目录"},
             status_code=409,
         )
-    scanned = await asyncio.to_thread(offline_backend.scan)
+    scanned = await asyncio.to_thread(backend.scan)
     saved_samples = _load_samples()
     imported = {_imported_episode(item) for item in saved_samples}
     episodes = []
@@ -742,13 +767,14 @@ async def api_offline_episodes():
 
 @app.get("/api/offline/episodes/{name}/preview")
 async def api_offline_preview(name: str):
-    if offline_backend is None:
+    backend = _available_episode_backend()
+    if backend is None:
         return JSONResponse(
-            {"ok": False, "error": "未配置离线遥操作任务目录，请用 --teleop-task-dir 启动"},
+            {"ok": False, "error": "未配置可读取的 episode 任务目录"},
             status_code=409,
         )
     try:
-        jpeg = await asyncio.to_thread(offline_backend.preview_jpeg, name)
+        jpeg = await asyncio.to_thread(backend.preview_jpeg, name)
     except EpisodeValidationError as exc:
         status = 404 if "元数据不存在" in str(exc) else 422
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=status)
@@ -761,13 +787,14 @@ async def api_offline_preview(name: str):
 
 @app.get("/api/offline/episodes/{name}/depth-overlay")
 async def api_offline_depth_overlay(name: str):
-    if offline_backend is None:
+    backend = _available_episode_backend()
+    if backend is None:
         return JSONResponse(
-            {"ok": False, "error": "未配置离线遥操作任务目录，请用 --teleop-task-dir 启动"},
+            {"ok": False, "error": "未配置可读取的 episode 任务目录"},
             status_code=409,
         )
     try:
-        png = await asyncio.to_thread(offline_backend.depth_overlay_png, name)
+        png = await asyncio.to_thread(backend.depth_overlay_png, name)
     except EpisodeValidationError as exc:
         status = 404 if "元数据不存在" in str(exc) else 422
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=status)
@@ -784,14 +811,15 @@ async def api_offline_depth_overlay(name: str):
 
 @app.get("/api/offline/episodes/{name}/point-cloud.ply")
 async def api_offline_point_cloud(name: str, stride: int = 2):
-    if offline_backend is None:
+    backend = _available_episode_backend()
+    if backend is None:
         return JSONResponse(
-            {"ok": False, "error": "未配置离线遥操作任务目录，请用 --teleop-task-dir 启动"},
+            {"ok": False, "error": "未配置可读取的 episode 任务目录"},
             status_code=409,
         )
     try:
         ply, cloud = await asyncio.to_thread(
-            offline_backend.point_cloud_ply, name, stride
+            backend.point_cloud_ply, name, stride
         )
     except EpisodeValidationError as exc:
         status = 404 if "元数据不存在" in str(exc) else 422
@@ -818,9 +846,10 @@ async def api_offline_point_cloud(name: str, stride: int = 2):
 
 @app.post("/api/offline/pick")
 async def api_offline_pick(body: dict):
-    if offline_backend is None:
+    backend = _available_episode_backend()
+    if backend is None:
         return JSONResponse(
-            {"ok": False, "error": "未配置离线遥操作任务目录，请用 --teleop-task-dir 启动"},
+            {"ok": False, "error": "未配置可读取的 episode 任务目录"},
             status_code=409,
         )
     try:
@@ -832,7 +861,7 @@ async def api_offline_pick(body: dict):
         message = str(exc) if str(exc) else "需要 episode、整数 u 和整数 v"
         return JSONResponse({"ok": False, "error": message}, status_code=400)
     try:
-        result = await asyncio.to_thread(offline_backend.pick, name, u, v)
+        result = await asyncio.to_thread(backend.pick, name, u, v)
     except EpisodeValidationError as exc:
         status = 404 if "元数据不存在" in str(exc) else 422
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=status)
@@ -845,9 +874,10 @@ async def api_offline_pick(body: dict):
 
 @app.post("/api/offline/confirm-points")
 async def api_offline_confirm_points(body: dict):
-    if offline_backend is None:
+    backend = _available_episode_backend()
+    if backend is None:
         return JSONResponse(
-            {"ok": False, "error": "未配置离线遥操作任务目录，请用 --teleop-task-dir 启动"},
+            {"ok": False, "error": "未配置可读取的 episode 任务目录"},
             status_code=409,
         )
     try:
@@ -868,7 +898,7 @@ async def api_offline_confirm_points(body: dict):
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
     try:
         result = await asyncio.to_thread(
-            offline_backend.confirm_points,
+            backend.confirm_points,
             name.strip(),
             cloud_id.strip(),
             stride,
@@ -888,9 +918,10 @@ async def api_offline_confirm_points(body: dict):
 
 @app.post("/api/offline/detect-markers")
 async def api_offline_detect_markers(body: dict):
-    if offline_backend is None:
+    backend = _available_episode_backend()
+    if backend is None:
         return JSONResponse(
-            {"ok": False, "error": "未配置离线遥操作任务目录，请用 --teleop-task-dir 启动"},
+            {"ok": False, "error": "未配置可读取的 episode 任务目录"},
             status_code=409,
         )
     try:
@@ -900,7 +931,7 @@ async def api_offline_detect_markers(body: dict):
     except (KeyError, TypeError, ValueError) as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
     try:
-        result = await asyncio.to_thread(offline_backend.detect_markers, name.strip())
+        result = await asyncio.to_thread(backend.detect_markers, name.strip())
     except EpisodeValidationError as exc:
         status = 404 if "元数据不存在" in str(exc) else 422
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=status)
@@ -913,9 +944,10 @@ async def api_offline_detect_markers(body: dict):
 
 @app.post("/api/offline/confirm-markers")
 async def api_offline_confirm_markers(body: dict):
-    if offline_backend is None:
+    backend = _available_episode_backend()
+    if backend is None:
         return JSONResponse(
-            {"ok": False, "error": "未配置离线遥操作任务目录，请用 --teleop-task-dir 启动"},
+            {"ok": False, "error": "未配置可读取的 episode 任务目录"},
             status_code=409,
         )
     try:
@@ -929,7 +961,7 @@ async def api_offline_confirm_markers(body: dict):
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
     try:
         result = await asyncio.to_thread(
-            offline_backend.confirm_markers, name.strip(), markers
+            backend.confirm_markers, name.strip(), markers
         )
     except EpisodeValidationError as exc:
         status = 404 if "元数据不存在" in str(exc) else 422

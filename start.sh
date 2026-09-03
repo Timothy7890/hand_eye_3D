@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # 一键启动 hand_eye_3D 前后端。
 #
-#   ./start.sh              # 默认：H2 真机 + ZMQ RGB-D + 手臂控制可用（网页点「获取控制」后才接管真机）
+#   ./start.sh              # 默认：7012 实时采集，7013 同时读取已落盘 episode
 #   ./start.sh --no-arm     # 不启用手臂控制（只读 rt/lowstate，绝不发布，可与其他控制程序并存）
+#   ./start.sh --teleop-task-dir /path/to/task  # 兼容的纯离线处理模式
 #   ./start.sh <其他参数>    # 其余参数原样传给 run_server.py（如 --arm-grav-in-float）
 #
 # Ctrl+C 退出：后端会先把手臂权重渐出、交还本体控制器（此时请扶住手臂），再退出。
@@ -65,6 +66,9 @@ done
 if [ "$OFFLINE" -eq 1 ]; then
   ARM_ARGS=()
   echo "离线遥操作数据模式：不打开相机、不连接或控制机器人。"
+else
+  echo "统一实时模式：7012 连接相机并采集；7013 读取同一目录中已落盘的 episode。"
+  echo "在 7012 按 C 完成采集后，到 7013 点击刷新即可加载。"
 fi
 
 VITE_BIN="$PWD/frontend/node_modules/.bin/vite"

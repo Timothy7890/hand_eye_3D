@@ -34,7 +34,7 @@ MOUNT_POINT_ID_RE = re.compile(r"^(?:palm-red|back-green)-(?:0[1-8])$")
 
 
 def _state():
-    """app 模块的注入状态（save_path / offline_backend 等），运行时读取。"""
+    """app 模块的注入状态（save_path / episode backend 等），运行时读取。"""
     from . import app as app_state
 
     return app_state
@@ -299,9 +299,10 @@ async def api_hand_model(hand_id: str, joints: str | None = None):
 @router.post("/api/offline/confirm-mount-points")
 async def api_confirm_mount_points(body: dict):
     state = _state()
-    if state.offline_backend is None:
+    backend = state._available_episode_backend()
+    if backend is None:
         return JSONResponse(
-            {"ok": False, "error": "未配置离线遥操作任务目录，请用 --teleop-task-dir 启动"},
+            {"ok": False, "error": "未配置可读取的 episode 任务目录"},
             status_code=409,
         )
     try:
@@ -357,7 +358,7 @@ async def api_confirm_mount_points(body: dict):
     }
     try:
         result = await asyncio.to_thread(
-            state.offline_backend.confirm_mount_points,
+            backend.confirm_mount_points,
             episode.strip(),
             str(cloud_id).strip(),
             stride,

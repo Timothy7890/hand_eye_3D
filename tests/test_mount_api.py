@@ -48,12 +48,14 @@ class MountApiTest(unittest.TestCase):
         self.root = Path(self.tempdir.name)
         self.old_save_path = app_module.save_path
         self.old_offline = app_module.offline_backend
+        self.old_episode = app_module.episode_backend
         self.old_mount_calib = app_module.mount_calib_path
         self.old_pose_provider = app_module.pose_provider
         self.old_arm_side = app_module.arm_side
         self.old_camera = app_module.camera
         app_module.save_path = self.root / "session"
         app_module.offline_backend = None
+        app_module.episode_backend = None
         app_module.mount_calib_path = None
         app_module.arm_side = "right"
         app_module.pose_provider = SimpleNamespace(
@@ -92,6 +94,7 @@ class MountApiTest(unittest.TestCase):
         self.capability_patch.stop()
         app_module.save_path = self.old_save_path
         app_module.offline_backend = self.old_offline
+        app_module.episode_backend = self.old_episode
         app_module.mount_calib_path = self.old_mount_calib
         app_module.pose_provider = self.old_pose_provider
         app_module.arm_side = self.old_arm_side
@@ -124,7 +127,7 @@ class MountApiTest(unittest.TestCase):
 
     # ---------- 离线配对确认 ----------
 
-    def test_confirm_mount_points_offline(self):
+    def test_confirm_mount_points_with_live_episode_backend(self):
         task_dir = self.root / "task"
         task_dir.mkdir()
         calib_path = self.root / "rgbd.json"
@@ -133,8 +136,8 @@ class MountApiTest(unittest.TestCase):
         with patch("backend.offline.RobotModel", _FakeRobotModel), patch(
             "backend.offline.load_robot_config", return_value={}
         ):
-            app_module.offline_backend = OfflineEpisodeBackend(task_dir, calib_path)
-        cloud = app_module.offline_backend.point_cloud("episode_0001", 2)
+            app_module.episode_backend = OfflineEpisodeBackend(task_dir, calib_path)
+        cloud = app_module.episode_backend.point_cloud("episode_0001", 2)
 
         p_hand = [0.013, -0.027, 0.006]
         body = {

@@ -112,13 +112,22 @@ def main() -> int:
         session_dir = session_dir / datetime.now().strftime("%Y%m%d_%H%M%S")
 
     offline_backend = None
+    episode_backend = None
+    live_record_task_dir = None
     if args.teleop_task_dir:
-        offline_backend = OfflineEpisodeBackend(args.teleop_task_dir, args.rgbd_calib)
+        offline_backend = OfflineEpisodeBackend(
+            args.teleop_task_dir, args.rgbd_calib, arm=args.arm
+        )
         camera = make_camera("mock")
         print("[handeye3d] mode = offline（不打开、不占用 Orbbec 相机）")
         print(f"[handeye3d] teleop_task_dir = {offline_backend.task_dir}")
         print(f"[handeye3d] rgbd_calib = {offline_backend.rgbd_calib_path}")
     else:
+        live_record_task_dir = Path(args.record_task_dir).expanduser().resolve()
+        live_record_task_dir.mkdir(parents=True, exist_ok=True)
+        episode_backend = OfflineEpisodeBackend(
+            live_record_task_dir, args.rgbd_calib, arm=args.arm
+        )
         camera = make_camera(
             args.camera_source,
             serial=args.camera_serial,
@@ -174,13 +183,14 @@ def main() -> int:
     app_module.arm_factory = arm_factory
     app_module.save_path = session_dir
     app_module.offline_backend = offline_backend
+    app_module.episode_backend = episode_backend
     app_module.teleop_task_dir = (
         offline_backend.task_dir if offline_backend is not None else None
     )
     app_module.record_task_dir = (
         None
         if offline_backend is not None
-        else Path(args.record_task_dir).expanduser().resolve()
+        else live_record_task_dir
     )
     app_module.rgbd_calib_path = Path(args.rgbd_calib).expanduser().resolve()
     app_module.mount_calib_path = (

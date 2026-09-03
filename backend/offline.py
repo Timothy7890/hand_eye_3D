@@ -25,6 +25,10 @@ RIGHT_ARM_DATASET_JOINTS = [
     "right_wrist_pitch",
     "right_wrist_yaw",
 ]
+ARM_DATASET_JOINTS = {
+    "right": RIGHT_ARM_DATASET_JOINTS,
+    "left": [name.replace("right_", "left_", 1) for name in RIGHT_ARM_DATASET_JOINTS],
+}
 DEPTH_VALID_MIN_MM = 60.0
 DEPTH_VALID_MAX_MM = 15000.0
 DEPTH_MAX_SPREAD_MM = 80.0
@@ -43,7 +47,7 @@ class OfflineFrame:
     index: int
     color_path: Path
     depth_path: Path
-    right_q: np.ndarray
+    arm_q: np.ndarray
     timestamps: dict[str, Any]
 
 
@@ -109,23 +113,33 @@ class OfflinePointCloud:
 class OfflineEpisodeBackend:
     """一个 robot-style task 目录对应的只读离线数据后端。"""
 
-    def __init__(self, task_dir: str | Path, rgbd_calib_path: str | Path):
+    def __init__(
+        self,
+        task_dir: str | Path,
+        rgbd_calib_path: str | Path,
+        arm: str = "right",
+    ):
         self.task_dir = Path(task_dir).expanduser().resolve()
         self.rgbd_calib_path = Path(rgbd_calib_path).expanduser().resolve()
         if not self.task_dir.is_dir():
             raise ValueError(f"遥操作任务目录不存在或不是目录: {self.task_dir}")
+        if arm not in ARM_DATASET_JOINTS:
+            raise ValueError(f"不支持的手臂 {arm!r}，必须是 right 或 left")
+        self.arm = arm
+        self.arm_state_key = f"{arm}_arm"
+        self.dataset_joint_order = ARM_DATASET_JOINTS[arm]
 
         self.calibration = RGBDCalibration.from_file(self.rgbd_calib_path)
         self.aligner = SoftwareDepthAligner(self.calibration)
         config = load_robot_config(H2_ROBOT_CONFIG_PATH)
         self.robot_model = RobotModel(config)
-        self.chain = "right_arm"
+        self.chain = self.arm_state_key
         self.base_link = self.robot_model.base_link(self.chain)
         self.wrist_link = self.robot_model.end_link(self.chain)
         self.joint_names = self.robot_model.joint_names(self.chain)
         if len(self.joint_names) != 7:
             raise ValueError(
-                f"H2 right_arm 配置应有 7 个关节，实际为 {len(self.joint_names)}"
+                f"H2 {self.chain} 配置应有 7 个关节，实际为 {len(self.joint_names)}"
             )
         self._aligned_depth_cache: dict[tuple[Any, ...], np.ndarray] = {}
         self._point_cloud_cache: dict[tuple[Any, ...], OfflinePointCloud] = {}
@@ -217,10 +231,10 @@ class OfflineEpisodeBackend:
                 f"{name} 声明 {declared_count} 帧，但 data 中有 {len(rows)} 帧"
             )
 
-        order = info.get("right_arm_joint_order")
-        if order != RIGHT_ARM_DATASET_JOINTS:
+        order = info.get(f"{self.arm_state_key}_joint_order")
+        if order != self.dataset_joint_order:
             raise EpisodeValidationError(
-                f"{name} 的右臂关节顺序不符合 H2 生产约定"
+                f"{name} 的{self.arm}臂关节顺序不符合 H2 生产约定"
             )
         episode_warnings: list[str] = []
         serial = info.get("camera_serial")
@@ -236,14 +250,16 @@ class OfflineEpisodeBackend:
                 raise EpisodeValidationError(f"{name} 第 {position} 帧必须是 JSON object")
             try:
                 index = int(row.get("idx", position))
-                q = np.asarray(row["states"]["right_arm"]["qpos"], dtype=float)
+                q = np.asarray(
+                    row["states"][self.arm_state_key]["qpos"], dtype=float
+                )
             except (KeyError, TypeError, ValueError) as exc:
                 raise EpisodeValidationError(
-                    f"{name} 第 {position} 帧缺少右臂 qpos"
+                    f"{name} 第 {position} 帧缺少{self.arm}臂 qpos"
                 ) from exc
             if q.shape != (7,) or not np.all(np.isfinite(q)):
                 raise EpisodeValidationError(
-                    f"{name} 第 {position} 帧右臂 qpos 必须是 7 个有限数值"
+                    f"{name} 第 {position} 帧{self.arm}臂 qpos 必须是 7 个有限数值"
                 )
 
             color_path = self._resolve_asset(
@@ -304,7 +320,7 @@ class OfflineEpisodeBackend:
                     index=index,
                     color_path=color_path,
                     depth_path=depth_path,
-                    right_q=q.copy(),
+                    arm_q=q.copy(),
                     timestamps=dict(timestamps) if isinstance(timestamps, dict) else {},
                 )
             )
@@ -604,7 +620,7 @@ class OfflineEpisodeBackend:
         color_h, color_w = self.calibration.color_shape
         depth_stack = self._aligned_depth_stack(episode)
         q_median = np.median(
-            np.stack([frame.right_q for frame in episode.frames]), axis=0
+            np.stack([frame.arm_q for frame in episode.frames]), axis=0
         )
         T_base_wrist = self._wrist_pose(q_median)
         fx, fy, cx, cy = self.calibration.color_intrinsics
@@ -676,7 +692,7 @@ class OfflineEpisodeBackend:
                 "depth_frame_count": len(vals),
                 "burst_frames_used": len(vals),
                 "depth_spread_mm": spread,
-                "right_arm_q_median": q_median.tolist(),
+                f"{self.arm_state_key}_q_median": q_median.tolist(),
                 "qpos_median_rad": q_median.tolist(),
                 "base_link": self.base_link,
                 "wrist_link": self.wrist_link,
@@ -716,7 +732,7 @@ class OfflineEpisodeBackend:
             "confirmed_count": len(observations),
             "error_count": len(errors),
             "T_base_wrist": T_base_wrist.tolist(),
-            "right_arm_q_median": q_median.tolist(),
+            f"{self.arm_state_key}_q_median": q_median.tolist(),
             "burst_frames_used": len(episode.frames),
             "warnings": list(episode.warnings),
         }
@@ -779,7 +795,7 @@ class OfflineEpisodeBackend:
             )
 
         q_median = np.median(
-            np.stack([frame.right_q for frame in episode.frames]), axis=0
+            np.stack([frame.arm_q for frame in episode.frames]), axis=0
         )
         T_base_wrist = self._wrist_pose(q_median)
         representative = episode.representative
@@ -813,7 +829,7 @@ class OfflineEpisodeBackend:
                 "depth_frame_count": len(episode.frames),
                 "burst_frames_used": len(episode.frames),
                 "depth_spread_mm": spread,
-                "right_arm_q_median": q_median.tolist(),
+                f"{self.arm_state_key}_q_median": q_median.tolist(),
                 "qpos_median_rad": q_median.tolist(),
                 "base_link": self.base_link,
                 "wrist_link": self.wrist_link,
@@ -854,7 +870,7 @@ class OfflineEpisodeBackend:
             "error_count": 0,
             "errors": [],
             "T_base_wrist": T_base_wrist.tolist(),
-            "right_arm_q_median": q_median.tolist(),
+            f"{self.arm_state_key}_q_median": q_median.tolist(),
             "burst_frames_used": len(episode.frames),
             "warnings": list(episode.warnings),
         }
@@ -922,7 +938,7 @@ class OfflineEpisodeBackend:
             raise EpisodeValidationError("同一姿态中每个模型点只能确认一次")
 
         q_median = np.median(
-            np.stack([frame.right_q for frame in episode.frames]), axis=0
+            np.stack([frame.arm_q for frame in episode.frames]), axis=0
         )
         T_base_wrist = self._wrist_pose(q_median)
         representative = episode.representative
@@ -946,7 +962,7 @@ class OfflineEpisodeBackend:
                     "p_hand": selection["p_hand"],
                     "episode": episode.name,
                     "pose_id": episode.name,
-                    "arm": "right",
+                    "arm": self.arm,
                     "source": "point_cloud",
                     "vertex_index": index,
                     "cloud_id": cloud.cloud_id,
@@ -959,7 +975,7 @@ class OfflineEpisodeBackend:
                     "depth_frame_count": len(episode.frames),
                     "depth_spread_mm": spread,
                     "qpos_median_rad": q_median.tolist(),
-                    "right_arm_q_median": q_median.tolist(),
+                    f"{self.arm_state_key}_q_median": q_median.tolist(),
                     "base_link": self.base_link,
                     "wrist_link": self.wrist_link,
                     "camera_serial": episode.info.get("camera_serial"),
@@ -986,7 +1002,7 @@ class OfflineEpisodeBackend:
             "ok": True,
             "episode": episode.name,
             "pose_id": episode.name,
-            "arm": "right",
+            "arm": self.arm,
             "cloud_id": cloud.cloud_id,
             "point_cloud_stride": cloud.stride,
             "observations": observations,
@@ -1033,7 +1049,7 @@ class OfflineEpisodeBackend:
         fx, fy, cx, cy = self.calibration.color_intrinsics
         p_camera = np.array([(u - cx) * z / fx, (v - cy) * z / fy, z], dtype=float)
         q_median = np.median(
-            np.stack([frame.right_q for frame in episode.frames]), axis=0
+            np.stack([frame.arm_q for frame in episode.frames]), axis=0
         )
         T_base_wrist = self._wrist_pose(q_median)
         representative = episode.representative
@@ -1048,7 +1064,7 @@ class OfflineEpisodeBackend:
             "depth_frame_count": len(vals),
             "burst_frames_used": len(vals),
             "depth_spread_mm": spread,
-            "right_arm_q_median": q_median.tolist(),
+            f"{self.arm_state_key}_q_median": q_median.tolist(),
             "qpos_median_rad": q_median.tolist(),
             "T_base_wrist": T_base_wrist.tolist(),
             "base_link": self.base_link,

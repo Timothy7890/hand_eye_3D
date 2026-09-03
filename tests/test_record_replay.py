@@ -15,6 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from backend import app as app_module
+from backend.offline import OfflineEpisodeBackend
 
 
 def _stream(width: int, height: int) -> dict:
@@ -108,6 +109,7 @@ class ReplayEpisodeRecorderTest(unittest.TestCase):
             "camera": app_module.camera,
             "pose_provider": app_module.pose_provider,
             "offline_backend": app_module.offline_backend,
+            "episode_backend": app_module.episode_backend,
             "record_task_dir": app_module.record_task_dir,
             "rgbd_calib_path": app_module.rgbd_calib_path,
             "save_path": app_module.save_path,
@@ -125,6 +127,10 @@ class ReplayEpisodeRecorderTest(unittest.TestCase):
         app_module.pose_provider = self.pose_provider
         app_module.offline_backend = None
         app_module.record_task_dir = root / "task"
+        app_module.record_task_dir.mkdir()
+        app_module.episode_backend = OfflineEpisodeBackend(
+            app_module.record_task_dir, calibration_path
+        )
         app_module.rgbd_calib_path = calibration_path
         app_module.save_path = root / "results"
         app_module.arm_side = "right"
@@ -216,6 +222,62 @@ class ReplayEpisodeRecorderTest(unittest.TestCase):
         for row in payload["data"]:
             self.assertIn("left_arm", row["states"])
             self.assertNotIn("right_arm", row["states"])
+
+    def test_live_recording_is_immediately_available_to_episode_browser(self):
+        status_before = asyncio.run(app_module.api_status())
+        self.assertEqual(status_before["mode"], "live")
+        self.assertTrue(status_before["offline"]["enabled"])
+        self.assertEqual(status_before["offline"]["source"], "record_task_dir")
+        self.assertEqual(
+            status_before["offline"]["episode_task_dir"],
+            str(app_module.record_task_dir),
+        )
+        self.assertEqual(
+            status_before["offline"]["task_dir"], str(app_module.record_task_dir)
+        )
+
+        recorded = asyncio.run(app_module.api_record_episode({"frame_count": 3}))
+        self.assertTrue(recorded["ok"])
+
+        listing = asyncio.run(app_module.api_offline_episodes())
+        self.assertTrue(listing["ok"])
+        self.assertEqual(
+            [episode["name"] for episode in listing["episodes"]],
+            [recorded["episode"]],
+        )
+        status_after = asyncio.run(app_module.api_status())
+        self.assertEqual(status_after["mode"], "live")
+        self.assertTrue(status_after["recording"]["enabled"])
+
+    def test_pure_offline_backend_remains_mode_and_browser_priority(self):
+        live_reader = app_module.episode_backend
+        offline_reader = type(
+            "OfflineReader",
+            (),
+            {
+                "task_dir": Path("/pure/offline"),
+                "arm": "right",
+                "base_link": "torso_link",
+                "wrist_link": "right_wrist_yaw_link",
+                "calibration": type(
+                    "Calibration",
+                    (),
+                    {"color_shape": (3, 4), "serial": "OFFLINE"},
+                )(),
+                "scan": lambda self: [],
+                "episode_names": lambda self: set(),
+            },
+        )()
+        app_module.offline_backend = offline_reader
+
+        self.assertIs(app_module._available_episode_backend(), offline_reader)
+        status = asyncio.run(app_module.api_status())
+        self.assertEqual(status["mode"], "offline")
+        self.assertTrue(status["offline"]["enabled"])
+        self.assertEqual(status["offline"]["source"], "teleop_task_dir")
+        self.assertEqual(status["offline"]["task_dir"], "/pure/offline")
+        self.assertEqual(status["offline"]["episode_task_dir"], "/pure/offline")
+        self.assertIsNot(app_module._available_episode_backend(), live_reader)
 
     def test_request_validation_and_capture_only_status(self):
         invalid_id = asyncio.run(
