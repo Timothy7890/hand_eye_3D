@@ -132,6 +132,77 @@ class MountApiTest(unittest.TestCase):
         missing = self.client.get("/api/hands/no-such-hand/model")
         self.assertEqual(missing.status_code, 404)
 
+    def test_calibration_catalog_recommends_matching_hand_eye_2d_result(self):
+        project_root = self.root / "calib" / "hand_eye_3D"
+        handeye_2d_session = (
+            project_root.parent
+            / "hand_eye_2D"
+            / "handeye_data"
+            / "20260902_170106"
+        )
+        handeye_2d_session.mkdir(parents=True)
+        current_intrinsics = handeye_2d_session / "camera_intrinsics.json"
+        current_intrinsics.write_text(
+            json.dumps(
+                {
+                    "serial": "CP0T263000BE",
+                    "width": 1920,
+                    "height": 1080,
+                }
+            ),
+            encoding="utf-8",
+        )
+        current_calib = handeye_2d_session / "handeye_result_left.json"
+        current_calib.write_text(
+            json.dumps(
+                {
+                    "eye": "left",
+                    "method": "park",
+                    "base_link": "torso_link",
+                    "T_cam2base": np.eye(4).tolist(),
+                    "R_cam2base": np.eye(3).tolist(),
+                    "t_cam2base_m": [0.0, 0.0, 0.0],
+                    "intrinsics_file": str(current_intrinsics),
+                }
+            ),
+            encoding="utf-8",
+        )
+        old_intrinsics = app_module.save_path / "old_intrinsics.json"
+        old_intrinsics.write_text(
+            json.dumps(
+                {
+                    "serial": "OLD-CAMERA",
+                    "width": 1920,
+                    "height": 1080,
+                }
+            ),
+            encoding="utf-8",
+        )
+        old_calib = app_module.save_path / "handeye3d_result.json"
+        old_calib.write_text(
+            json.dumps(
+                {
+                    "base_link": "torso_link",
+                    "T_cam2base": np.eye(4).tolist(),
+                    "R_cam2base": np.eye(3).tolist(),
+                    "t_cam2base_m": [0.0, 0.0, 0.0],
+                    "intrinsics_file": str(old_intrinsics),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch("backend.mount_api.PROJECT_ROOT", project_root):
+            response = self.client.get("/api/mount/calibrations")
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["recommended_path"], str(current_calib))
+        entries = {item["path"]: item for item in payload["calibrations"]}
+        self.assertTrue(entries[str(current_calib)]["compatible"])
+        self.assertEqual(entries[str(current_calib)]["source"], "hand_eye_2D")
+        self.assertFalse(entries[str(old_calib)]["compatible"])
+        self.assertIn("相机序列号不一致", entries[str(old_calib)]["error"])
+
     def _model_profile_body(self, name: str = "生产手点位") -> dict:
         metadata = get_hand_model(HAND_ID).metadata()
         link = metadata["links"][0]["link"]
@@ -294,8 +365,8 @@ class MountApiTest(unittest.TestCase):
     def test_detect_mount_candidates_api_preserves_backend_payload(self):
         calls = []
 
-        def detect(episode, stride):
-            calls.append((episode, stride))
+        def detect(episode, stride, markers=None):
+            calls.append((episode, stride, markers))
             return {
                 "ok": True,
                 "episode": episode,
@@ -325,7 +396,7 @@ class MountApiTest(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(calls, [("episode_0001", 1)])
+        self.assertEqual(calls, [("episode_0001", 1, None)])
         self.assertEqual(
             response.json()["candidates"][0]["candidate_id"],
             "marker-red-01",
@@ -507,6 +578,35 @@ class MountApiTest(unittest.TestCase):
             merged["R_cam2base"], T_cam2base[:3, :3], atol=1e-12
         )
         self.assertEqual(merged["mount_calib_used"], str(external_calib))
+
+        loaded_result = self.client.get("/api/mount/result")
+        self.assertEqual(loaded_result.status_code, 200)
+        loaded_payload = loaded_result.json()
+        self.assertFalse(loaded_payload["stale"])
+        self.assertEqual(
+            loaded_payload["result"]["T_wrist2hand"],
+            result["T_wrist2hand"],
+        )
+        self.assertEqual(
+            loaded_payload["result"]["saved_to"],
+            str(app_module.save_path / "mount_result.json"),
+        )
+        diagnostics = self.client.get("/api/mount/diagnostics")
+        self.assertEqual(diagnostics.status_code, 200)
+        diagnostic_payload = diagnostics.json()
+        self.assertTrue(diagnostic_payload["available"])
+        self.assertFalse(diagnostic_payload["stale"])
+        self.assertEqual(diagnostic_payload["summary"]["sample_count"], 15)
+        self.assertEqual(diagnostic_payload["summary"]["pose_count"], 3)
+        self.assertLess(diagnostic_payload["summary"]["rms"], 1e-6)
+        self.assertIn("red", diagnostic_payload["summary"]["by_color"])
+        self.assertIn("green", diagnostic_payload["summary"]["by_color"])
+        self.assertEqual(diagnostic_payload["order_check"]["verdict"], "consistent")
+        self.assertIsNone(diagnostic_payload["order_check"]["best_swap"])
+        self.assertEqual(len(diagnostic_payload["poses"]), 3)
+        self.assertEqual(len(diagnostic_payload["poses"][0]["observations"]), 5)
+        self.client.delete("/api/mount/samples/0")
+        self.assertTrue(self.client.get("/api/mount/result").json()["stale"])
 
     def test_batch_rejects_bad_depth_and_schema(self):
         observations, _, _ = self._synthetic_batch()

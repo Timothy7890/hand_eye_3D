@@ -156,6 +156,22 @@ class OfflineEpisodeBackend:
         """当前磁盘上仍存在 data.json 的 episode 名称。"""
         return {path.parent.name for path in self._candidate_paths()}
 
+    def episode_camera_serials(self) -> dict[str, str | None]:
+        """返回当前 episode 名称对应的采集相机，防止重用编号时匹配到旧样本。"""
+        serials: dict[str, str | None] = {}
+        for data_path in self._candidate_paths():
+            try:
+                payload = self._read_json(data_path)
+            except EpisodeValidationError:
+                continue
+            info = payload.get("info")
+            if isinstance(info, dict) and info.get("kind") == "hand_eye_calibration":
+                serial = info.get("camera_serial")
+                serials[data_path.parent.name] = (
+                    serial.strip() if isinstance(serial, str) and serial.strip() else None
+                )
+        return serials
+
     @staticmethod
     def _read_json(path: Path) -> dict[str, Any]:
         try:
@@ -404,7 +420,12 @@ class OfflineEpisodeBackend:
             "warnings": [*episode.warnings, *detection_warnings],
         }
 
-    def detect_mount_candidates(self, name: str, stride: int = 2) -> dict[str, Any]:
+    def detect_mount_candidates(
+        self,
+        name: str,
+        stride: int = 2,
+        edited_markers: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         """检测重复红/绿圆，并映射到当前稳定点云中的最近顶点。"""
         episode = self.load(name)
         image = cv2.imread(
@@ -414,7 +435,28 @@ class OfflineEpisodeBackend:
             raise EpisodeValidationError(
                 f"代表 RGB 图片无法用于安装圆点检测: {episode.representative.color_path}"
             )
-        detected = detect_mount_markers_bgr(image)
+        if edited_markers is None:
+            detected = detect_mount_markers_bgr(image)
+        else:
+            if not isinstance(edited_markers, list):
+                raise EpisodeValidationError("markers 必须是数组")
+            detected = [
+                self._validated_marker(marker, position)
+                for position, marker in enumerate(edited_markers)
+            ]
+            if any(marker["color"] not in {"red", "green"} for marker in detected):
+                raise EpisodeValidationError("安装圆点颜色只能是 red 或 green")
+            ids = [marker["id"] for marker in detected]
+            if len(set(ids)) != len(ids):
+                raise EpisodeValidationError("安装圆点 id 必须唯一")
+            detected = [
+                {
+                    **marker,
+                    "center": np.asarray(marker["center"], dtype=float).tolist(),
+                    "radius_px": float(marker["radius_px"]),
+                }
+                for marker in detected
+            ]
         cloud = self.point_cloud(name, stride)
         cloud_pixels = cloud.pixels.astype(np.float64, copy=False)
         candidates: list[dict[str, Any]] = []
@@ -423,7 +465,7 @@ class OfflineEpisodeBackend:
         for marker in detected:
             center = np.asarray(marker["center"], dtype=np.float64)
             search_radius = max(
-                4.0, float(marker["radius_px"]) * 0.9, float(stride) * 1.5
+                4.0, float(marker["radius_px"]) * 1.5, float(stride) * 1.5
             )
             delta = cloud_pixels - center
             nearby = np.flatnonzero(

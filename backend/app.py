@@ -16,6 +16,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
@@ -25,6 +26,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .camera import CameraBase, MockCamera
+from .hand_hold import HandHoldController
 from .mount_api import router as mount_router
 from .offline import (
     DEFAULT_RGBD_CALIB_PATH,
@@ -68,9 +70,14 @@ record_task_dir: Path | None = None
 rgbd_calib_path: Path = DEFAULT_RGBD_CALIB_PATH
 mount_calib_path: Path | None = None
 mount_profile_dir: Path = PROJECT_ROOT / "handeye3d_data" / "mount_model_profiles"
+hand_service_url: str = "https://127.0.0.1:18089"
+hand_hold = HandHoldController(lambda: hand_service_url)
 samples_lock = threading.Lock()
 record_lock = threading.Lock()
-CAPABILITY_REGISTRY_URL = "http://127.0.0.1:18000/api/capability/registry"
+# 18000 能力中心：地址与启动拜访快照由 run_server 注入（快照供后续按
+# 配置区分功能用；确认样本时的校验走 get_capability_hint 每次现查）
+capability_url: str = "http://127.0.0.1:18000"
+capability_snapshot: dict | None = None
 RECORD_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 ARM_DATASET_JOINTS = {
     "right": list(RIGHT_ARM_DATASET_JOINTS),
@@ -119,12 +126,22 @@ def _load_samples() -> list[dict]:
         episode_names = getattr(backend, "episode_names", None)
         if callable(episode_names):
             active = episode_names()
+            episode_serials: dict[str, str | None] = {}
+            serial_reader = getattr(backend, "episode_camera_serials", None)
+            if callable(serial_reader):
+                episode_serials = serial_reader()
             items = [
                 sample
                 for sample in items
                 if (
                     _imported_episode(sample) is None
-                    or _imported_episode(sample) in active
+                    or (
+                        _imported_episode(sample) in active
+                        and _sample_matches_episode_camera(
+                            sample,
+                            episode_serials.get(_imported_episode(sample)),
+                        )
+                    )
                 )
             ]
     return items
@@ -136,6 +153,24 @@ def _imported_episode(sample: dict):
     if value is None and isinstance(source, dict):
         value = source.get("episode")
     return value
+
+
+def _sample_matches_episode_camera(
+    sample: dict[str, Any],
+    episode_camera_serial: str | None,
+) -> bool:
+    sample_camera_serial = sample.get("camera_serial")
+    if not sample_camera_serial:
+        camera = sample.get("camera")
+        if isinstance(camera, dict):
+            sample_camera_serial = camera.get("serial")
+    if not sample_camera_serial:
+        provenance = sample.get("provenance")
+        if isinstance(provenance, dict):
+            sample_camera_serial = provenance.get("camera_serial")
+    if not episode_camera_serial or not sample_camera_serial:
+        return True
+    return str(sample_camera_serial).strip() == str(episode_camera_serial).strip()
 
 
 def _sample_schema_version(sample: dict) -> int:
@@ -206,7 +241,8 @@ async def get_capability_hint() -> dict:
 
     def _fetch():
         request = urllib.request.Request(
-            CAPABILITY_REGISTRY_URL, headers={"Accept": "application/json"}
+            capability_url.rstrip("/") + "/api/capability/registry",
+            headers={"Accept": "application/json"},
         )
         with urllib.request.urlopen(request, timeout=1.5) as response:
             return json.loads(response.read().decode("utf-8", errors="replace"))

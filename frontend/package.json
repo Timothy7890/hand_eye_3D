@@ -6,8 +6,10 @@
   "scripts": {
     "dev": "vite",
     "dev:pointcloud": "vite --config vite.pointcloud.config.js",
+    "dev:mount-diagnostics": "vite --config vite.mount-diagnostics.config.js",
     "build": "vite build",
     "build:pointcloud": "vite build --config vite.pointcloud.config.js",
+    "build:mount-diagnostics": "vite build --config vite.mount-diagnostics.config.js",
     "preview": "vite preview"
   },
   "dependencies": {

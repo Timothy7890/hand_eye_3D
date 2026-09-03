@@ -16,6 +16,7 @@ venv/
 node_modules/
 dist/
 dist-pointcloud/
+dist-mount-diagnostics/
 
 # Local-only files
 .env

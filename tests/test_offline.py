@@ -226,6 +226,28 @@ class OfflineEpisodeBackendTest(unittest.TestCase):
             [2, 1],
         )
 
+        edited = [
+            {
+                "id": "manual-green-01",
+                "color": "green",
+                "center": [2.0, 1.0],
+                "radius_px": 3.0,
+                "source": "manual_rgb_review",
+            }
+        ]
+        with patch(
+            "backend.offline.detect_mount_markers_bgr",
+            side_effect=AssertionError("edited markers must bypass auto detection"),
+        ):
+            remapped = backend.detect_mount_candidates(
+                "episode_0008",
+                stride=1,
+                edited_markers=edited,
+            )
+        self.assertEqual(remapped["candidate_count"], 1)
+        self.assertEqual(remapped["candidates"][0]["candidate_id"], "manual-green-01")
+        self.assertEqual(remapped["candidates"][0]["center"], [2.0, 1.0])
+
     def test_serial_mismatch_is_visible_warning_not_validation_error(self):
         _write_episode(
             self.root,
@@ -487,6 +509,52 @@ class OrphanedOfflineSamplesTest(unittest.TestCase):
 
                 loaded = app_module._load_samples()
                 self.assertEqual([sample["index"] for sample in loaded], [0])
+            finally:
+                app_module.save_path = old_save_path
+                app_module.offline_backend = old_offline_backend
+                app_module.episode_backend = old_episode_backend
+
+    def test_reused_episode_name_excludes_samples_from_another_camera(self):
+        from backend import app as app_module
+
+        old_save_path = app_module.save_path
+        old_offline_backend = app_module.offline_backend
+        old_episode_backend = app_module.episode_backend
+        with tempfile.TemporaryDirectory() as tempdir:
+            try:
+                app_module.save_path = Path(tempdir)
+                app_module.offline_backend = None
+                app_module.episode_backend = SimpleNamespace(
+                    episode_names=lambda: {"episode_0001"},
+                    episode_camera_serials=lambda: {
+                        "episode_0001": "CURRENT-CAMERA"
+                    },
+                )
+                app_module.init_state()
+                samples_dir = Path(tempdir) / "samples"
+                (samples_dir / "0000.json").write_text(
+                    json.dumps(
+                        {
+                            "index": 0,
+                            "episode": "episode_0001",
+                            "camera_serial": "OLD-CAMERA",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                (samples_dir / "0001.json").write_text(
+                    json.dumps(
+                        {
+                            "index": 1,
+                            "episode": "episode_0001",
+                            "camera_serial": "CURRENT-CAMERA",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                loaded = app_module._load_samples()
+                self.assertEqual([sample["index"] for sample in loaded], [1])
             finally:
                 app_module.save_path = old_save_path
                 app_module.offline_backend = old_offline_backend

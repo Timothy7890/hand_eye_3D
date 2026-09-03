@@ -36,7 +36,7 @@ backend/
   robot.py     手腕位姿 Provider：manual / http / h2(DDS+FK) / mock
   app.py       FastAPI：点云、选点确认、样本管理、解算
 run_server.py  入口（后端 8132）
-frontend/      Vue3 + Vite：图像版 7012、点云版 7013
+frontend/      Vue3 + Vite：图像版 7012、点云版 7013、安装诊断版 7015
 config/        项目内 H2 配置；camera/ 下放设备专属 RGB-D 标定
 assets/        H2 URDF（FK 不需要 STL mesh）
 tools/         Orbbec 标定导出和重力自检工具
@@ -99,6 +99,7 @@ python run_server.py --camera-source mock --pose-source mock
 # 前端（分别启动）
 cd frontend && npm run dev                 # http://<IP>:7012 图像版
 cd frontend && npm run dev:pointcloud      # http://<IP>:7013 点云版
+cd frontend && npm run dev:mount-diagnostics  # http://<IP>:7015 安装标定诊断
 ```
 
 > 默认 H2 模式**只订阅** `rt/lowstate`，绝不发布 `rt/arm_sdk`/`rt/lowcmd`，
@@ -111,12 +112,14 @@ cd frontend && npm run dev:pointcloud      # http://<IP>:7013 点云版
 ./start.sh
 ```
 
-默认启动方式同时提供两个页面，并共用 `teleop_data/biaoding`：
+默认启动方式同时提供三个页面，并共用 `teleop_data/biaoding`：
 
 - `http://<IP>:7012` 连接实时 RGB-D 和 H2 位姿；摆好姿态后按 `C`，保存一组
   `episode_*`。
 - `http://<IP>:7013` 只读取已经完整落盘的 episode。7012 完成采集后在 7013
   点击刷新，即可生成点云并选点。
+- `http://<IP>:7015` 读取最新安装解算结果，把模型点、实际观测点和残差连线
+  叠加到灵巧手模型，并自动检查同色点编号互换是否能显著降低误差。
 - 目录还没有 episode 时，7013 会提示先去 7012 采集，不再要求
   `--teleop-task-dir`。
 
@@ -188,12 +191,13 @@ episode 的每种 canonical color 仍然只能保存一个观测。
    继续补充；同一手型号和同名再次保存会覆盖。方案与 episode 无关，固定存放在
    `handeye3d_data/mount_model_profiles/`，重启或开启新标定会话后仍可加载。
    可用 `--mount-profile-dir` 指定其他目录。进入点云配对前仍要求 16 点全部完成。
-6. 模型点全部标完后，再切换到中央「实体点云」页，为当前 episode 依次选择
-   同编号实体圆点。后端会在代表 RGB 中保留全部红/绿圆候选（同色不去重），
-   利用多帧对齐深度将圆心映射到稳定点云顶点；7013 以半透明红/绿球显示候选。
-   按红 1–8、绿 1–8 的已知顺序点击同色候选即可，误检或漏检时仍可直接点击
-   普通点云修正。模型点会在切换 episode 时保留；单个姿态不必看见全部
-   16 点，可以分多个 episode 采集手心和手背。
+6. 模型点全部标完后，先进入中央「RGB圆圈复核」页直接检查代表原图和识别圈。
+   实线圈已有稳定深度，虚线圈缺少稳定深度；可删除误检、补红/绿圆，或选中圆后
+   点击原图移动圆心。复核后再映射到「实体点云」，以半透明红/绿球显示候选。
+   按红 1–8、绿 1–8 的已知顺序点击同色候选即可，漏检时仍可点击普通点云。
+   当前 episode 看见几个就选择并保存几个，选中第一个点后保存按钮即启用；
+   再次进入同一 episode 会自动恢复已保存点并继续补选。`start.sh` 默认把进度固定
+   保存到 `handeye3d_data/biaoding/`，重启后不会因新建时间戳目录而丢失进度。
 7. 保存配对后运行安装解算。后端使用已有 `T_cam2base` 和每个 episode 的
    `T_base_wrist`，将相机点变换到腕系，再对模型点执行刚体配准：
 
@@ -203,6 +207,8 @@ episode 的每种 canonical color 仍然只能保存一个观测。
 `<save_path>/handeye3d_result_mount.json`。页面显示 RMS、4×4
 `T_wrist2hand`、模型叠加和派生的指尖 `tcp_points_wrist_m`。建议至少使用
 多个姿态并覆盖手心、手背两面；拟合 RMS 建议低于 5 mm。
+解算后打开 `http://<IP>:7015` 可逐姿态检查同编号连线；实心红/绿球为模型点，
+白色线框球为实际观测，长连线和红色误差项用于定位错点或点序问题。
 
 #### 7012 图像检测与编辑（保留）
 

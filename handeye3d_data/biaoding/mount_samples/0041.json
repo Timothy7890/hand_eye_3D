@@ -1,0 +1,128 @@
+{
+  "schema_version": 3,
+  "point_id": "palm-red-04",
+  "label": "手心红点 04",
+  "link": "right_base_link",
+  "hand_id": "qiangnao-1-right",
+  "hand_base_link": "base_link",
+  "hand_joints": {
+    "right_thumb_metacarpal_joint": 0,
+    "right_thumb_proximal_joint": 0,
+    "right_index_proximal_joint": 0,
+    "right_middle_proximal_joint": 0,
+    "right_ring_proximal_joint": 0,
+    "right_pinky_proximal_joint": 0
+  },
+  "p_local": [
+    0.007851784516396345,
+    -0.02691601915343208,
+    0.06868349146421338
+  ],
+  "p_hand": [
+    -0.007894555311654073,
+    -0.06870490363186323,
+    0.02684877688540274
+  ],
+  "episode": "episode_0009",
+  "pose_id": "episode_0009",
+  "arm": "right",
+  "source": "point_cloud",
+  "vertex_index": 285586,
+  "cloud_id": "7b52dfe78c5096456fcffa38",
+  "point_cloud_stride": 2,
+  "pixel": [
+    1240,
+    904
+  ],
+  "p_camera": [
+    0.08873290568590164,
+    0.11936444789171219,
+    0.33699649572372437
+  ],
+  "T_base_wrist": [
+    [
+      0.26265853924684435,
+      -0.9195833773681957,
+      -0.2921932645165119,
+      0.34897053994382404
+    ],
+    [
+      0.254545961689761,
+      0.35813629343839076,
+      -0.898301034570063,
+      -0.12887741190140753
+    ],
+    [
+      0.9307077119848899,
+      0.1615698220284756,
+      0.3281437908319128,
+      0.37932088896185495
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "depth_mm": 336.99649572372437,
+  "valid_depth_frames": 5,
+  "depth_frame_count": 5,
+  "depth_spread_mm": 0,
+  "qpos_median_rad": [
+    -0.8322697877883911,
+    -0.2558811902999878,
+    0.23357854783535004,
+    -0.1332286298274994,
+    1.22067129611969,
+    -0.3204222321510315,
+    0.24891236424446106
+  ],
+  "right_arm_q_median": [
+    -0.8322697877883911,
+    -0.2558811902999878,
+    0.23357854783535004,
+    -0.1332286298274994,
+    1.22067129611969,
+    -0.3204222321510315,
+    0.24891236424446106
+  ],
+  "base_link": "torso_link",
+  "wrist_link": "right_wrist_yaw_link",
+  "camera_serial": "CP0T263000BE",
+  "provenance": {
+    "mode": "offline_point_cloud_mount",
+    "episode": "episode_0009",
+    "task_dir": "/home/robot/yx/project/calib/hand_eye_3D/teleop_data/biaoding",
+    "data_json": "/home/robot/yx/project/calib/hand_eye_3D/teleop_data/biaoding/episode_0009/data.json",
+    "rgbd_calibration": "/home/robot/yx/project/calib/hand_eye_3D/config/camera/orbbec_rgbd_calibration.json",
+    "camera_serial": "CP0T263000BE",
+    "frame_indices": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "representative_frame": 2,
+    "representative_rgb": "/home/robot/yx/project/calib/hand_eye_3D/teleop_data/biaoding/episode_0009/rgb/000002_head_rgb.jpg",
+    "cloud_id": "7b52dfe78c5096456fcffa38",
+    "point_cloud_stride": 2,
+    "vertex_index": 285586,
+    "pixel": [
+      1240,
+      904
+    ],
+    "qpos_median_rad": [
+      -0.8322697877883911,
+      -0.2558811902999878,
+      0.23357854783535004,
+      -0.1332286298274994,
+      1.22067129611969,
+      -0.3204222321510315,
+      0.24891236424446106
+    ]
+  },
+  "index": 41,
+  "datetime": "2026-09-03T17:16:48"
+}

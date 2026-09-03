@@ -458,12 +458,158 @@ def detect_markers_bgr(
 
 
 def detect_mount_markers_bgr(image: np.ndarray) -> list[dict[str, Any]]:
-    """检测手安装标定的重复红/绿圆，不按 canonical color 去重。"""
-    return detect_markers_bgr(
-        image,
-        allowed_colors={"red", "green"},
-        keep_color_duplicates=True,
-    )
+    """用 HSV 连通域检测手安装贴纸，并为每种颜色保留最强空间簇。"""
+    bgr = np.asarray(image)
+    if bgr.ndim != 3 or bgr.shape[2] != 3 or bgr.dtype != np.uint8:
+        raise ValueError("安装 marker 检测输入必须是 uint8 BGR 图像")
+    height, width = bgr.shape[:2]
+    if height < 16 or width < 16:
+        raise ValueError("安装 marker 检测图像尺寸过小")
+    hsv = cv2.cvtColor(cv2.GaussianBlur(bgr, (5, 5), 0), cv2.COLOR_BGR2HSV)
+    hue, saturation, value = cv2.split(hsv)
+    masks = {
+        "red": (
+            ((hue <= 15) | (hue >= 165))
+            & (saturation >= 70)
+            & (value >= 50)
+        ),
+        "green": (
+            (hue >= 35)
+            & (hue <= 95)
+            & (saturation >= 45)
+            & (value >= 35)
+        ),
+    }
+    image_area = float(height * width)
+    min_area = max(30.0, image_area * 0.000025)
+    max_area = image_area * 0.015
+    min_radius = max(3.0, min(height, width) * 0.0025)
+    max_radius = min(height, width) * 0.06
+    link_radius = max(70.0, min(height, width) * 0.18)
+    result: list[dict[str, Any]] = []
+
+    for color in ("red", "green"):
+        mask = masks[color].astype(np.uint8) * 255
+        mask = cv2.morphologyEx(
+            mask, cv2.MORPH_OPEN, np.ones((3, 3), dtype=np.uint8)
+        )
+        mask = cv2.morphologyEx(
+            mask, cv2.MORPH_CLOSE, np.ones((5, 5), dtype=np.uint8)
+        )
+        contours, _ = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        candidates: list[dict[str, Any]] = []
+        for contour in contours:
+            area = float(cv2.contourArea(contour))
+            perimeter = float(cv2.arcLength(contour, True))
+            if not min_area <= area <= max_area or perimeter <= 0:
+                continue
+            (cx, cy), radius = cv2.minEnclosingCircle(contour)
+            radius = float(radius)
+            if not min_radius <= radius <= max_radius:
+                continue
+            circularity = float(4.0 * math.pi * area / (perimeter * perimeter))
+            fill_ratio = float(area / max(math.pi * radius * radius, 1e-9))
+            if circularity < 0.50 or fill_ratio < 0.45:
+                continue
+            confidence = float(
+                np.clip(0.55 * circularity + 0.45 * fill_ratio, 0.0, 1.0)
+            )
+            candidates.append(
+                {
+                    "color": color,
+                    "center": [float(cx), float(cy)],
+                    "radius_px": radius,
+                    "confidence": confidence,
+                    "color_confidence": confidence,
+                    "circularity": circularity,
+                    "source": "auto_hsv_component",
+                    "flags": [],
+                    "_quality": area * confidence,
+                }
+            )
+
+        pending = set(range(len(candidates)))
+        components: list[list[dict[str, Any]]] = []
+        while pending:
+            stack = [pending.pop()]
+            indices: list[int] = []
+            while stack:
+                index = stack.pop()
+                indices.append(index)
+                center = np.asarray(candidates[index]["center"])
+                linked = [
+                    other
+                    for other in pending
+                    if float(
+                        np.linalg.norm(
+                            np.asarray(candidates[other]["center"]) - center
+                        )
+                    )
+                    <= link_radius
+                ]
+                for other in linked:
+                    pending.remove(other)
+                    stack.append(other)
+            components.append([candidates[index] for index in indices])
+        strongest = max(
+            components,
+            key=lambda component: (
+                sum(
+                    item["_quality"]
+                    for item in sorted(
+                        component,
+                        key=lambda item: item["_quality"],
+                        reverse=True,
+                    )[:8]
+                ),
+                min(len(component), 8),
+            ),
+            default=[],
+        )
+        strongest = sorted(
+            strongest,
+            key=lambda item: item["_quality"],
+            reverse=True,
+        )[:8]
+        strongest.sort(
+            key=lambda item: (
+                round(item["center"][1], 4),
+                round(item["center"][0], 4),
+            )
+        )
+        for index, item in enumerate(strongest, start=1):
+            item = dict(item)
+            item.pop("_quality", None)
+            item["id"] = f"marker-{color}-{index:02d}"
+            item["center"] = [round(value, 3) for value in item["center"]]
+            item["radius_px"] = round(item["radius_px"], 3)
+            item["confidence"] = round(item["confidence"], 6)
+            item["color_confidence"] = round(item["color_confidence"], 6)
+            item["circularity"] = round(item["circularity"], 6)
+            result.append(item)
+    grouped = {
+        color: [item for item in result if item["color"] == color]
+        for color in ("red", "green")
+    }
+    scores = {
+        color: sum(
+            math.pi
+            * float(item["radius_px"]) ** 2
+            * float(item["confidence"])
+            for item in items
+        )
+        for color, items in grouped.items()
+    }
+    dominant = max(scores, key=scores.get)
+    other = "green" if dominant == "red" else "red"
+    if (
+        len(grouped[dominant]) >= 5
+        and scores[dominant] > max(scores[other] * 4.0, 1.0)
+    ):
+        result = grouped[dominant]
+    return result
 
 
 def detect_markers_jpeg(data: bytes) -> list[dict[str, Any]]:

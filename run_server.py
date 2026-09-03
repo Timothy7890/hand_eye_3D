@@ -83,6 +83,11 @@ def main() -> int:
         help="手安装模型点命名方案目录（默认固定在项目 handeye3d_data 下）",
     )
 
+    parser.add_argument("--hand-service-url", default="https://127.0.0.1:18089",
+                        help="18089 灵巧手控制服务地址（手安装标定「保持零位」用）")
+    parser.add_argument("--capability-url", default="http://127.0.0.1:18000",
+                        help="18000 能力中心地址（启动拜访，必须可达；"
+                             "start.sh 会自动拉起）")
     parser.add_argument("--pose-source", choices=["manual", "http", "h2", "mock"],
                         default="manual", help="手腕位姿来源（默认 manual 手填）")
     parser.add_argument("--pose-url", help="http 模式的 JSON 端点，返回 {\"T\": 4x4} 或 {\"xyz\",\"rpy\"}")
@@ -109,8 +114,21 @@ def main() -> int:
 
     from backend import app as app_module
     from backend.camera import make_camera
+    from backend.capability import (
+        CapabilityUnavailable,
+        describe_active,
+        fetch_capability_snapshot,
+    )
     from backend.offline import OfflineEpisodeBackend
     from backend.robot import make_pose_provider
+
+    # 启动拜访 18000（硬依赖，先于相机/机器人）：拿不到注册表快照就不启动
+    try:
+        capability_snapshot = fetch_capability_snapshot(args.capability_url)
+    except CapabilityUnavailable as exc:
+        print(f"[handeye3d] 启动拜访 18000 失败：{exc}")
+        return 1
+    print(f"[handeye3d] 18000 {describe_active(capability_snapshot)}")
 
     session_dir = Path(args.save_path)
     if not args.no_timestamp_dir:
@@ -206,6 +224,9 @@ def main() -> int:
     app_module.mount_profile_dir = (
         Path(args.mount_profile_dir).expanduser().resolve()
     )
+    app_module.hand_service_url = args.hand_service_url
+    app_module.capability_url = args.capability_url.rstrip("/")
+    app_module.capability_snapshot = capability_snapshot
     app_module.init_state()
 
     print(f"[handeye3d] save_path = {session_dir}")
@@ -220,6 +241,9 @@ def main() -> int:
     try:
         uvicorn.run(app_module.app, host=args.host, port=args.port)
     finally:
+        if app_module.hand_hold.status().get("running"):
+            print("[handeye3d] 停止灵巧手保持零位 ...")
+            app_module.hand_hold.stop()
         if app_module.arm_controller is not None:
             print("[handeye3d] 手臂权重渐出、交还本体控制器（请扶住手臂）...")
             app_module.arm_controller.shutdown()

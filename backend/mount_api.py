@@ -21,12 +21,15 @@ import numpy as np
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
+from .hand_hold import HOLD_SIDES, VENDOR_DEVICE_IDS, HandHoldError
 from .hands import HandCatalogError, get_hand_model, hand_catalog
 from .offline import EpisodeValidationError, PointCloudStaleError
+from .paths import PROJECT_ROOT
 from .solver import (
     MIN_MOUNT_POINTS,
     leave_one_pose_out_mount,
     solve_hand_mount,
+    solve_rigid_transform,
 )
 
 router = APIRouter()
@@ -335,6 +338,95 @@ def _load_mount_calibration(
     return calib, R_cam, t_cam, identity
 
 
+def _mount_calibration_catalog() -> tuple[list[dict[str, Any]], str | None]:
+    """列出 2D/3D 项目中的相机外参，并标记与当前 episode 是否兼容。"""
+    state = _state()
+    candidates: set[Path] = set()
+    if state.mount_calib_path is not None:
+        candidates.add(Path(state.mount_calib_path).expanduser().resolve())
+    latest = state._find_latest_calib()
+    if latest is not None:
+        candidates.add(Path(latest).expanduser().resolve())
+    for path in state.save_path.parent.glob("*/handeye3d_result.json"):
+        candidates.add(path.resolve())
+    handeye_2d_data = PROJECT_ROOT.parent / "hand_eye_2D" / "handeye_data"
+    if handeye_2d_data.is_dir():
+        for path in handeye_2d_data.glob("*/handeye_result*.json"):
+            candidates.add(path.resolve())
+
+    entries: list[dict[str, Any]] = []
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+        metadata = _normalized_camera_metadata(
+            _camera_metadata(payload, path) if isinstance(payload, dict) else {}
+        )
+        try:
+            _, _, _, identity = _load_mount_calibration(path)
+            compatible = True
+            error = None
+        except ValueError as exc:
+            compatible = False
+            error = str(exc)
+            identity = {
+                "serial": metadata.get("serial"),
+                "width": metadata.get("width"),
+                "height": metadata.get("height"),
+                "base_link": payload.get("base_link") if isinstance(payload, dict) else None,
+            }
+        stat = path.stat()
+        source = "hand_eye_2D" if "hand_eye_2D" in path.parts else "hand_eye_3D"
+        entries.append(
+            {
+                "path": str(path),
+                "filename": path.name,
+                "session": path.parent.name,
+                "source": source,
+                "eye": payload.get("eye") if isinstance(payload, dict) else None,
+                "method": payload.get("method") if isinstance(payload, dict) else None,
+                "solved_at": (
+                    payload.get("solved_at") if isinstance(payload, dict) else None
+                ),
+                "modified_at": datetime.fromtimestamp(stat.st_mtime).isoformat(
+                    timespec="seconds"
+                ),
+                "serial": identity.get("serial"),
+                "width": identity.get("width"),
+                "height": identity.get("height"),
+                "base_link": identity.get("base_link"),
+                "compatible": compatible,
+                "error": error,
+            }
+        )
+    entries.sort(
+        key=lambda item: (bool(item["compatible"]), item["modified_at"]),
+        reverse=True,
+    )
+    configured = (
+        str(Path(state.mount_calib_path).expanduser().resolve())
+        if state.mount_calib_path is not None
+        else None
+    )
+    recommended = next(
+        (
+            item["path"]
+            for item in entries
+            if item["compatible"] and item["path"] == configured
+        ),
+        None,
+    )
+    if recommended is None:
+        recommended = next(
+            (item["path"] for item in entries if item["compatible"]),
+            None,
+        )
+    return entries, recommended
+
+
 def _validate_mount_point_id(point_id: Any, position: int) -> str:
     if not isinstance(point_id, str) or not MOUNT_POINT_ID_RE.fullmatch(point_id.strip()):
         raise ValueError(
@@ -400,6 +492,18 @@ def _active_combo_payload(capability: dict | None) -> dict[str, Any] | None:
 
 
 # --------------- 手型号目录与模型 ---------------
+
+
+@router.get("/api/mount/calibrations")
+async def api_mount_calibrations():
+    calibrations, recommended = await asyncio.to_thread(
+        _mount_calibration_catalog
+    )
+    return {
+        "calibrations": calibrations,
+        "count": len(calibrations),
+        "recommended_path": recommended,
+    }
 
 
 @router.get("/api/hands")
@@ -620,11 +724,14 @@ async def api_detect_mount_candidates(body: dict):
     try:
         episode = body["episode"]
         stride = body.get("stride", 2)
+        markers = body.get("markers")
         if not isinstance(episode, str) or not episode.strip():
             raise ValueError("episode 必须是非空字符串")
         if isinstance(stride, bool):
             raise ValueError("stride 必须是整数")
         stride = int(stride)
+        if markers is not None and not isinstance(markers, list):
+            raise ValueError("markers 必须是数组")
     except (KeyError, TypeError, ValueError) as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
     try:
@@ -632,6 +739,7 @@ async def api_detect_mount_candidates(body: dict):
             backend.detect_mount_candidates,
             episode.strip(),
             stride,
+            markers,
         )
     except EpisodeValidationError as exc:
         status = 404 if "元数据不存在" in str(exc) else 422
@@ -732,6 +840,70 @@ async def api_confirm_mount_points(body: dict):
     if capability_warning:
         result.setdefault("warnings", []).append(capability_warning)
     return result
+
+
+# --------------- 18089 手保持零位 ---------------
+
+
+@router.get("/api/mount/hand-hold")
+async def api_mount_hand_hold_status():
+    return {"ok": True, "hold": _state().hand_hold.status()}
+
+
+@router.post("/api/mount/hand-hold/start")
+async def api_mount_hand_hold_start(body: dict | None = None):
+    """开启保持。Body: {hand_id} 或显式 {device_id, side}。"""
+    state = _state()
+    body = body or {}
+    device_id = body.get("device_id")
+    side = body.get("side")
+    hand_id = body.get("hand_id")
+    if hand_id is not None:
+        if not isinstance(hand_id, str) or not hand_id.strip():
+            return JSONResponse(
+                {"ok": False, "error": "hand_id 必须是非空字符串"}, status_code=400
+            )
+        try:
+            spec = get_hand_model(hand_id.strip()).spec
+        except HandCatalogError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+        except KeyError as exc:
+            return JSONResponse(
+                {"ok": False, "error": str(exc.args[0])}, status_code=404
+            )
+        device_id = device_id or VENDOR_DEVICE_IDS.get(spec.vendor)
+        side = side or spec.side
+        if device_id is None:
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": f"手型号 {hand_id} 的厂商 {spec.vendor!r} 没有对应的 "
+                    "18089 设备映射，请显式传 device_id",
+                },
+                status_code=400,
+            )
+    if not isinstance(device_id, str) or not device_id.strip():
+        return JSONResponse(
+            {"ok": False, "error": "需要 hand_id 或 device_id 以确定 18089 设备"},
+            status_code=400,
+        )
+    if side not in HOLD_SIDES:
+        return JSONResponse(
+            {"ok": False, "error": "side 必须是 left 或 right"}, status_code=400
+        )
+    try:
+        hold = await asyncio.to_thread(state.hand_hold.start, device_id.strip(), side)
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    except HandHoldError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
+    return {"ok": True, "hold": hold}
+
+
+@router.post("/api/mount/hand-hold/stop")
+async def api_mount_hand_hold_stop():
+    hold = await asyncio.to_thread(_state().hand_hold.stop)
+    return {"ok": True, "hold": hold}
 
 
 # --------------- 样本管理 ---------------
@@ -905,6 +1077,254 @@ async def api_mount_clear():
 
 
 # --------------- 解算 ---------------
+
+
+@router.get("/api/mount/result")
+async def api_mount_result():
+    state = _state()
+    path = state.save_path / "mount_result.json"
+    if not path.is_file():
+        return {"result": None, "stale": False}
+    try:
+        result = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return JSONResponse(
+            {"ok": False, "error": f"安装标定结果无法读取: {exc}"},
+            status_code=500,
+        )
+    if not isinstance(result, dict):
+        return JSONResponse(
+            {"ok": False, "error": "安装标定结果格式不合法"},
+            status_code=500,
+        )
+    result["saved_to"] = str(path)
+    merged = state.save_path / "handeye3d_result_mount.json"
+    if merged.is_file():
+        result["merged_calib"] = str(merged)
+    current_indices = {
+        sample.get("index") for sample in _load_mount_samples()
+    }
+    result_indices = set(result.get("sample_indices") or [])
+    stale = current_indices != result_indices
+    return {"result": result, "stale": stale}
+
+
+def _diagnostic_stats(values_mm: list[float]) -> dict[str, float | int]:
+    values = np.asarray(values_mm, dtype=float)
+    if not len(values):
+        return {"count": 0, "rms": 0.0, "mean": 0.0, "max": 0.0}
+    return {
+        "count": int(len(values)),
+        "rms": float(np.sqrt(np.mean(values**2))),
+        "mean": float(np.mean(values)),
+        "max": float(np.max(values)),
+    }
+
+
+def _mount_point_display(point_id: str) -> tuple[str, str]:
+    number = int(point_id.rsplit("-", 1)[-1])
+    if point_id.startswith("palm-red-"):
+        return f"红{number}", "red"
+    return f"绿{number}", "green"
+
+
+def _best_same_color_swap(
+    samples: list[dict[str, Any]],
+    observed_wrist: list[np.ndarray],
+) -> dict[str, Any]:
+    point_by_id: dict[str, np.ndarray] = {}
+    for sample in samples:
+        point_by_id.setdefault(
+            sample["point_id"], np.asarray(sample["p_hand"], dtype=float)
+        )
+
+    def solve_mapping(mapping: dict[str, str]) -> float:
+        source = np.stack(
+            [point_by_id[mapping[sample["point_id"]]] for sample in samples]
+        )
+        target = np.stack(observed_wrist)
+        return float(solve_rigid_transform(source, target)["residual_mm"]["rms"])
+
+    identity = {point_id: point_id for point_id in point_by_id}
+    current_rms = solve_mapping(identity)
+    best_rms = current_rms
+    best_pair: list[str] | None = None
+    tested = 0
+    for prefix in ("palm-red-", "back-green-"):
+        point_ids = sorted(
+            point_id for point_id in point_by_id if point_id.startswith(prefix)
+        )
+        for left_index, left in enumerate(point_ids):
+            for right in point_ids[left_index + 1 :]:
+                tested += 1
+                mapping = dict(identity)
+                mapping[left], mapping[right] = right, left
+                rms = solve_mapping(mapping)
+                if rms < best_rms:
+                    best_rms = rms
+                    best_pair = [left, right]
+
+    improvement = current_rms - best_rms
+    significant = improvement >= max(0.5, current_rms * 0.08)
+    if best_pair is None or improvement < 1e-6:
+        verdict = "consistent"
+        label = "未发现编号互换收益"
+        message = f"已检查 {tested} 种同色两点互换，当前顺序误差最低。"
+    elif significant:
+        verdict = "suspect"
+        labels = [_mount_point_display(point_id)[0] for point_id in best_pair]
+        label = f"建议复核 {labels[0]} / {labels[1]}"
+        message = (
+            f"互换后 RMS 可由 {current_rms:.2f} 降至 {best_rms:.2f} mm，"
+            "存在点序错误的可能。"
+        )
+    else:
+        verdict = "consistent"
+        label = "当前编号基本一致"
+        message = (
+            f"最佳互换仅改善 {improvement:.2f} mm，"
+            "不足以说明点序有误。"
+        )
+    return {
+        "verdict": verdict,
+        "label": label,
+        "message": message,
+        "tested_swap_count": tested,
+        "current_rms_mm": current_rms,
+        "best_swap_rms_mm": best_rms,
+        "improvement_mm": improvement,
+        "best_swap": best_pair,
+    }
+
+
+@router.get("/api/mount/diagnostics")
+async def api_mount_diagnostics():
+    """返回 7015 使用的手安装对应关系、误差向量与点序诊断。"""
+    state = _state()
+    result_path = state.save_path / "mount_result.json"
+    if not result_path.is_file():
+        return {"available": False, "reason": "尚未生成安装标定结果"}
+    try:
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        samples = _load_mount_samples()
+        calib_path = Path(result["calib_used"]).expanduser().resolve()
+        _, R_cam, t_cam, calib_identity = _load_mount_calibration(
+            calib_path, require_camera_identity=False
+        )
+        T_mount = np.asarray(result["T_wrist2hand"], dtype=float).reshape(4, 4)
+    except (KeyError, OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        return JSONResponse(
+            {"ok": False, "error": f"安装标定诊断数据无法读取: {exc}"},
+            status_code=500,
+        )
+    if not samples:
+        return {"available": False, "reason": "安装样本已被清空"}
+
+    R_mount = T_mount[:3, :3]
+    t_mount = T_mount[:3, 3]
+    observations: list[dict[str, Any]] = []
+    observed_wrist: list[np.ndarray] = []
+    by_pose: dict[str, list[dict[str, Any]]] = {}
+    by_point: dict[str, list[dict[str, Any]]] = {}
+    for sample in samples:
+        p_camera = np.asarray(sample["p_camera"], dtype=float)
+        p_base = R_cam @ p_camera + t_cam
+        p_wrist = np.linalg.solve(
+            np.asarray(sample["T_base_wrist"], dtype=float),
+            np.array([*p_base, 1.0]),
+        )[:3]
+        p_hand = np.asarray(sample["p_hand"], dtype=float)
+        predicted_wrist = R_mount @ p_hand + t_mount
+        observed_hand = R_mount.T @ (p_wrist - t_mount)
+        residual_vector_mm = (observed_hand - p_hand) * 1000.0
+        residual_mm = float(np.linalg.norm(residual_vector_mm))
+        short_label, color = _mount_point_display(sample["point_id"])
+        observation = {
+            "sample_index": sample.get("index"),
+            "pose_id": sample["pose_id"],
+            "point_id": sample["point_id"],
+            "label": sample.get("label") or sample["point_id"],
+            "short_label": short_label,
+            "color": color,
+            "model_point_hand_m": p_hand.tolist(),
+            "observed_point_hand_m": observed_hand.tolist(),
+            "predicted_point_wrist_m": predicted_wrist.tolist(),
+            "observed_point_wrist_m": p_wrist.tolist(),
+            "residual_vector_hand_mm": residual_vector_mm.tolist(),
+            "residual_mm": residual_mm,
+            "pixel": sample.get("pixel"),
+        }
+        observations.append(observation)
+        observed_wrist.append(p_wrist)
+        by_pose.setdefault(sample["pose_id"], []).append(observation)
+        by_point.setdefault(sample["point_id"], []).append(observation)
+
+    poses = []
+    for pose_id, pose_observations in sorted(by_pose.items()):
+        stats = _diagnostic_stats(
+            [observation["residual_mm"] for observation in pose_observations]
+        )
+        poses.append(
+            {
+                "pose_id": pose_id,
+                **stats,
+                "observations": pose_observations,
+            }
+        )
+    point_stats = []
+    for point_id, point_observations in sorted(by_point.items()):
+        stats = _diagnostic_stats(
+            [observation["residual_mm"] for observation in point_observations]
+        )
+        short_label, color = _mount_point_display(point_id)
+        point_stats.append(
+            {
+                "point_id": point_id,
+                "short_label": short_label,
+                "color": color,
+                **stats,
+            }
+        )
+    color_stats = {
+        color: _diagnostic_stats(
+            [
+                observation["residual_mm"]
+                for observation in observations
+                if observation["color"] == color
+            ]
+        )
+        for color in ("red", "green")
+    }
+
+    current_indices = {sample.get("index") for sample in samples}
+    result_indices = set(result.get("sample_indices") or [])
+    return {
+        "ok": True,
+        "available": True,
+        "stale": current_indices != result_indices,
+        "hand_id": result.get("hand_id"),
+        "hand_label": result.get("hand_label"),
+        "solved_at": result.get("solved_at"),
+        "calib_camera": calib_identity,
+        "summary": {
+            "sample_count": len(observations),
+            "pose_count": len(poses),
+            "point_count": len(point_stats),
+            **_diagnostic_stats(
+                [observation["residual_mm"] for observation in observations]
+            ),
+            "by_color": color_stats,
+            "leave_one_pose_out": result.get("leave_one_pose_out"),
+        },
+        "order_check": await asyncio.to_thread(
+            _best_same_color_swap, samples, observed_wrist
+        ),
+        "poses": poses,
+        "point_stats": point_stats,
+        "T_wrist2hand": result["T_wrist2hand"],
+        "t_wrist2hand_m": result.get("t_wrist2hand_m"),
+        "rpy_deg": result.get("rpy_deg"),
+    }
 
 
 @router.post("/api/mount/solve")
