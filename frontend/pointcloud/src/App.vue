@@ -40,6 +40,7 @@ const mountSaveBusy = ref(false)
 const mountSolveBusy = ref(false)
 const mountResult = ref(null)
 const overlayVisible = ref(false)
+const mountViewport = ref('model')
 const handViewerHost = ref(null)
 const mountSlots = [
   ...Array.from({ length: 8 }, (_, index) => ({
@@ -419,7 +420,7 @@ function onPointerUp(event) {
   if (mode.value === 'mount' && !activeMountDraft.value?.p_hand) {
     const moved = Math.hypot(event.clientX - pointerStart.x, event.clientY - pointerStart.y)
     pointerStart = null
-    if (moved <= 5) infoMsg.value = '请先选择槽位，再在右侧零位手模型表面点击模型点'
+    if (moved <= 5) infoMsg.value = '请先选择槽位，再切到中央零位手模型选择模型点'
     return
   }
   const moved = Math.hypot(event.clientX - pointerStart.x, event.clientY - pointerStart.y)
@@ -562,7 +563,10 @@ function chooseNextMountSlot() {
   const next = mountSlots.find((slot) =>
     !mountPairedIds.value.has(slot.point_id) && !mountSavedIds.value.has(slot.point_id),
   )
-  if (next) activeMountSlotId.value = next.point_id
+  if (next) {
+    activeMountSlotId.value = next.point_id
+    mountViewport.value = 'model'
+  }
 }
 
 function removeSelection(color) {
@@ -778,10 +782,13 @@ function activateMountSlot(pointId) {
   activeMountSlotId.value = pointId
   const draft = mountDrafts.value.find((item) => item.point_id === pointId)
   if (draft?.p_hand && draft.vertexIndex == null) {
+    mountViewport.value = 'cloud'
     infoMsg.value = `${draft.label} 已有模型点，请在点云点击同序实体点`
   } else if (draft?.vertexIndex != null || mountSavedIds.value.has(pointId)) {
+    mountViewport.value = 'model'
     infoMsg.value = `${mountSlotInfo(pointId).label} 已完成；可重新点击模型和点云后覆盖`
   } else {
+    mountViewport.value = 'model'
     infoMsg.value = `当前槽：${mountSlotInfo(pointId).label}，请先点击零位手模型表面`
   }
   refreshHandPointMarkers()
@@ -828,6 +835,7 @@ function onHandPointerUp(event) {
       meshFaceIndex: hit.faceIndex,
     },
   ]
+  mountViewport.value = 'cloud'
   infoMsg.value = `${slot.label} 模型点已选，请在当前 episode 点云点击同序实体点`
   refreshHighlights()
   refreshHandPointMarkers()
@@ -836,6 +844,7 @@ function onHandPointerUp(event) {
 function removeMountDraft(pointId) {
   mountDrafts.value = mountDrafts.value.filter((item) => item.point_id !== pointId)
   activeMountSlotId.value = pointId
+  mountViewport.value = 'model'
   refreshHighlights()
   refreshHandPointMarkers()
 }
@@ -1024,6 +1033,7 @@ function formatMatrixValue(value) {
 async function setMode(nextMode) {
   if (mode.value === nextMode) return
   mode.value = nextMode
+  if (nextMode === 'mount') mountViewport.value = 'model'
   refreshHighlights()
   if (nextMode !== 'mount') {
     if (overlayGroup) overlayGroup.visible = false
@@ -1031,6 +1041,7 @@ async function setMode(nextMode) {
   }
   await nextTick()
   initHandViewer()
+  resizeHandViewer()
   try {
     if (!mountSamples.value.length) await refreshMountSamples()
     if (!hands.value.length) await loadHandsCatalog()
@@ -1179,8 +1190,15 @@ watch(cloudStride, async (value, oldValue) => {
 
 watch(selectedHandId, async (value, oldValue) => {
   if (value && value !== oldValue && mode.value === 'mount' && handRenderer) {
+    mountViewport.value = 'model'
     await loadHandModel()
   }
+})
+
+watch(mountViewport, async () => {
+  await nextTick()
+  resizeViewer()
+  resizeHandViewer()
 })
 
 onMounted(async () => {
@@ -1262,28 +1280,57 @@ onBeforeUnmount(() => {
 
       <section class="viewer-column">
         <div class="viewer-toolbar">
-          <div>
-            <strong>{{ selectedEpisode || '未选择 episode' }}</strong>
-            <span v-if="pointCount">{{ pointCount.toLocaleString() }} points</span>
+          <div class="viewer-title">
+            <strong>
+              {{
+                mode === 'mount' && mountViewport === 'model'
+                  ? (currentHand?.label || '零位灵巧手模型')
+                  : (selectedEpisode || '未选择 episode')
+              }}
+            </strong>
+            <span v-if="mode === 'mount' && mountViewport === 'model'">
+              {{ handModel?.base_link || '等待模型' }} · 六个手关节全零
+            </span>
+            <span v-else-if="pointCount">{{ pointCount.toLocaleString() }} points</span>
           </div>
-          <label>
-            点大小
-            <input v-model.number="pointSize" type="range" min="1" max="12" step="1" />
-          </label>
-          <label>
-            采样
-            <select v-model.number="cloudStride" :disabled="cloudBusy">
-              <option :value="1">1× 精细</option>
-              <option :value="2">2× 默认</option>
-              <option :value="3">3× 流畅</option>
-              <option :value="4">4× 快速</option>
-            </select>
-          </label>
-          <button class="secondary-button" :disabled="cloudBusy || !selectedEpisode" @click="loadPointCloud">
-            重新加载
-          </button>
+          <div v-if="mode === 'mount'" class="viewport-tabs">
+            <button
+              :class="{ active: mountViewport === 'model' }"
+              @click="mountViewport = 'model'"
+            >
+              零位手模型
+            </button>
+            <button
+              :class="{ active: mountViewport === 'cloud' }"
+              @click="mountViewport = 'cloud'"
+            >
+              实体点云
+            </button>
+          </div>
+          <template v-if="mode === 'marker' || mountViewport === 'cloud'">
+            <label>
+              点大小
+              <input v-model.number="pointSize" type="range" min="1" max="12" step="1" />
+            </label>
+            <label>
+              采样
+              <select v-model.number="cloudStride" :disabled="cloudBusy">
+                <option :value="1">1× 精细</option>
+                <option :value="2">2× 默认</option>
+                <option :value="3">3× 流畅</option>
+                <option :value="4">4× 快速</option>
+              </select>
+            </label>
+            <button class="secondary-button" :disabled="cloudBusy || !selectedEpisode" @click="loadPointCloud">
+              重新加载
+            </button>
+          </template>
         </div>
-        <div ref="viewerHost" class="viewer">
+        <div
+          v-show="mode === 'marker' || mountViewport === 'cloud'"
+          ref="viewerHost"
+          class="viewer"
+        >
           <div v-if="cloudBusy" class="viewer-overlay">
             <span class="spinner"></span>
             正在对齐五帧深度并生成点云…
@@ -1294,6 +1341,24 @@ onBeforeUnmount(() => {
             <span class="z">Z 前</span>
           </div>
           <div class="viewer-help">单击选点 · 左键拖动旋转 · 右键平移 · 滚轮缩放</div>
+        </div>
+        <div
+          v-show="mode === 'mount' && mountViewport === 'model'"
+          ref="handViewerHost"
+          class="viewer hand-main-viewer"
+        >
+          <div v-if="handBusy" class="viewer-overlay">
+            <span class="spinner"></span>
+            正在加载手模型…
+          </div>
+          <div class="axis-legend">
+            <span class="x">X</span>
+            <span class="y">Y</span>
+            <span class="z">Z</span>
+          </div>
+          <div class="viewer-help">
+            当前 {{ activeMountSlot?.label }} · 单击模型贴点位置 · 左键旋转 · 右键平移 · 滚轮缩放
+          </div>
         </div>
         <div v-if="errorMsg" class="message error">{{ errorMsg }}</div>
         <div v-else-if="infoMsg" class="message success">{{ infoMsg }}</div>
@@ -1314,7 +1379,7 @@ onBeforeUnmount(() => {
             <div class="panel-heading compact">
               <div>
                 <h2>1. 选择零位手模型</h2>
-                <span>仅加载全零关节 · mesh 表面可点击</span>
+                <span>模型显示在中央大视区 · mesh 表面可点击</span>
               </div>
               <span class="zero-badge">6 DOF = 0</span>
             </div>
@@ -1323,16 +1388,12 @@ onBeforeUnmount(() => {
                 {{ hand.label }}（{{ hand.side === 'left' ? '左手' : '右手' }}）
               </option>
             </select>
-            <div ref="handViewerHost" class="hand-viewer">
-              <div v-if="handBusy" class="viewer-overlay">
-                <span class="spinner"></span>
-                正在加载手模型…
-              </div>
-              <div class="hand-viewer-help">先选槽，再单击 mesh · 拖动旋转 · 滚轮缩放</div>
-            </div>
             <p class="model-meta">
               {{ currentHand?.vendor || '—' }} · {{ handModel?.base_link || '等待模型' }}
             </p>
+            <button class="secondary-button model-focus-button" @click="mountViewport = 'model'">
+              在中央查看并选择模型点
+            </button>
           </section>
 
           <section class="side-card mount-slots-card">

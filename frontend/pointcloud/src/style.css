@@ -213,7 +213,7 @@ button {
   background: #0d131e;
 }
 
-.viewer-toolbar > div {
+.viewer-title {
   min-width: 180px;
   margin-right: auto;
 }
@@ -248,6 +248,31 @@ button {
   color: #c7d2e1;
   padding: 5px 8px;
   font-size: 11px;
+}
+
+.viewport-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 3px;
+  border: 1px solid #28364a;
+  border-radius: 8px;
+  background: #09111c;
+}
+
+.viewport-tabs button {
+  padding: 5px 10px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: #7f8da2;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.viewport-tabs button.active {
+  border-color: #3478e5;
+  background: #162846;
+  color: #dbe7ff;
 }
 
 .secondary-button,
@@ -630,32 +655,20 @@ button:disabled {
   font-size: 12px;
 }
 
-.hand-viewer {
-  position: relative;
-  height: 230px;
-  border: 1px solid #1e2a3b;
-  border-radius: 9px;
-  overflow: hidden;
+.hand-main-viewer {
   background: #0b1220;
 }
 
-.hand-viewer canvas {
+.hand-main-viewer canvas {
   display: block;
   width: 100% !important;
   height: 100% !important;
   cursor: crosshair;
 }
 
-.hand-viewer-help {
-  position: absolute;
-  right: 7px;
-  bottom: 6px;
-  padding: 4px 6px;
-  border-radius: 4px;
-  background: rgba(4, 8, 14, 0.72);
-  color: #66758a;
-  font-size: 9px;
-  pointer-events: none;
+.model-focus-button {
+  width: 100%;
+  margin-top: 8px;
 }
 
 .model-meta {

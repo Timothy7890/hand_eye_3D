@@ -821,19 +821,35 @@ function wristRpyDeg(T) {
   return [roll, pitch, yaw].map((a) => (a * 180 / Math.PI).toFixed(0)).join('/')
 }
 
-// 卸力时空格先保持当前位置；其余实时模式下空格拍摄一个离线 episode。
-function onKeyDown(ev) {
-  if (ev.code !== 'Space' || ev.repeat) return
+// 与 hand_eye_2D 保持一致：B 协力拖动、空格接住、C 拍摄。
+async function onKeyDown(ev) {
+  if (ev.repeat) return
   const tag = ev.target?.tagName
   if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'BUTTON' || tag === 'SELECT') return
-  if (arm.value?.float && !armBusy.value) {
+
+  if (ev.code === 'Space') {
     ev.preventDefault()
-    armPost('stop')
+    if (arm.value?.float && !armBusy.value) await armPost('stop')
     return
   }
-  if (!offlineMode.value && status.value?.recording?.enabled && !recordBusy.value) {
+
+  if (ev.code === 'KeyB') {
     ev.preventDefault()
-    recordEpisode()
+    if (!arm.value?.enabled || !arm.value?.armed) {
+      window.alert('请先获取手臂控制，再按 B 进入协力模式')
+      return
+    }
+    if (arm.value.float || armBusy.value) return
+    if (arm.value.jog_enabled) await armPost('disable_jog')
+    await armPost('hand_move')
+    return
+  }
+
+  if (ev.code === 'KeyC') {
+    ev.preventDefault()
+    if (!offlineMode.value && status.value?.recording?.enabled && !recordBusy.value) {
+      await recordEpisode()
+    }
   }
 }
 
@@ -1028,9 +1044,9 @@ onBeforeUnmount(() => {
             <button v-if="arm.jog_enabled" class="btn"
                     :disabled="armBusy" @click="armPost('disable_jog')">停止点动</button>
             <button v-if="!arm.jog_enabled && !arm.float" class="btn warn"
-                    :disabled="armBusy" @click="handMove">卸力拖动</button>
+                    :disabled="armBusy" @click="handMove">进入协力模式 [B]</button>
             <button v-if="arm.float" class="btn primary"
-                    :disabled="armBusy" @click="armPost('stop')">保持当前位置（空格）</button>
+                    :disabled="armBusy" @click="armPost('stop')">接住并保持 [空格]</button>
             <button class="btn warn" :disabled="armBusy" @click="disarmArm">归还控制</button>
           </div>
           <div class="field-row">
@@ -1060,7 +1076,8 @@ onBeforeUnmount(() => {
             点动有限速（{{ arm.max_speed_rad_s }} rad/s）并钳制在关节限位内。
             卸力模式下 kp=0 只留阻尼 + 重力前馈（按实测角实时算），手臂近似失重、
             推到哪停哪；补偿有偏差时可能缓慢飘移，请护住手臂；
-            摆好位置后点「保持当前位置」或<b>按空格</b>即锁定（单手扶臂时方便）。
+            按 <b>B</b> 进入协力模式，摆好后按<b>空格</b>接住并锁定；
+            按 <b>C</b> 拍摄当前姿态。
             「归还控制」权重 1 秒渐出后交还本体控制器，请扶住手臂。
           </div>
         </template>
@@ -1200,7 +1217,7 @@ onBeforeUnmount(() => {
               :disabled="!status?.recording?.enabled || recordBusy"
               @click="recordEpisode"
             >
-              {{ recordBusy ? '正在保存 5 帧…' : '拍摄当前姿态（空格）' }}
+              {{ recordBusy ? '正在保存 5 帧…' : '拍摄当前姿态 [C]' }}
             </button>
             <span v-if="recordMessage" class="coord ok">{{ recordMessage }}</span>
             <span v-else class="coord dim">
