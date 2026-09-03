@@ -775,6 +775,18 @@ button:disabled {
   color: #fbd38d;
 }
 
+.mount-stage-actions {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 8px;
+  margin-top: 9px;
+}
+
+.mount-stage-actions .primary-button {
+  width: 100%;
+}
+
 .mount-selection-list {
   max-height: 210px;
 }

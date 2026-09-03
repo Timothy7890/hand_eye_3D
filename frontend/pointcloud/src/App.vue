@@ -25,7 +25,7 @@ const pointSize = ref(4)
 const solveResult = ref(null)
 const imageFrontendUrl = `${window.location.protocol}//${window.location.hostname}:7012`
 
-// 手安装标定固定使用 16 个有序物理点；每个槽依次完成模型点和点云点。
+// 手安装标定分两阶段：先一次性标完 16 个模型点，再按 episode 配对点云点。
 const mode = ref('marker')
 const hands = ref([])
 const selectedHandId = ref('')
@@ -46,12 +46,14 @@ const mountSlots = [
   ...Array.from({ length: 8 }, (_, index) => ({
     point_id: `palm-red-${String(index + 1).padStart(2, '0')}`,
     label: `手心红点 ${String(index + 1).padStart(2, '0')}`,
+    shortLabel: `红${index + 1}`,
     side: 'palm',
     color: '#ef4444',
   })),
   ...Array.from({ length: 8 }, (_, index) => ({
     point_id: `back-green-${String(index + 1).padStart(2, '0')}`,
     label: `手背绿点 ${String(index + 1).padStart(2, '0')}`,
+    shortLabel: `绿${index + 1}`,
     side: 'back',
     color: '#22c55e',
   })),
@@ -101,9 +103,17 @@ const mountSamplesByPose = computed(() => {
   const poses = new Set(mountSamples.value.map((sample) => sample.pose_id))
   return poses.size
 })
-const mountDraftIds = computed(() => new Set(mountDrafts.value.map((item) => item.point_id)))
+const mountDraftIds = computed(() =>
+  new Set(mountDrafts.value.filter((item) => item.p_hand).map((item) => item.point_id)),
+)
+const allMountModelPointsSelected = computed(() =>
+  mountDraftIds.value.size === mountSlots.length,
+)
 const mountPairedIds = computed(() =>
   new Set(mountDrafts.value.filter((item) => item.vertexIndex != null).map((item) => item.point_id)),
+)
+const mountPairedDrafts = computed(() =>
+  mountDrafts.value.filter((item) => item.vertexIndex != null),
 )
 const mountSavedIds = computed(() =>
   new Set(mountSavedForEpisode.value.map((item) => item.point_id)),
@@ -358,7 +368,7 @@ async function loadPointCloud() {
   infoMsg.value = ''
   solveResult.value = null
   selections.value = []
-  mountDrafts.value = []
+  keepOnlyMountModelPoints()
   mountSavedCloudPoints.value = []
   cloudId.value = ''
   pointCount.value = 0
@@ -478,7 +488,10 @@ function onPointerUp(event) {
     infoMsg.value = `${draft.label} 已完成配对（距点击 ${screenDistancePx.toFixed(1)} px）`
     refreshHighlights()
     refreshHandPointMarkers()
-    chooseNextMountSlot()
+    const next = chooseNextMountCloudSlot()
+    infoMsg.value = next
+      ? `${draft.label} 已完成；下一项：${next.label}`
+      : `${draft.label} 已完成；当前 episode 的点云配对已完成`
     return
   }
 
@@ -559,14 +572,72 @@ function mountSlotInfo(pointId) {
   }
 }
 
-function chooseNextMountSlot() {
+function modelOnlyMountDraft(item) {
+  const slot = mountSlotInfo(item.point_id)
+  return {
+    ...slot,
+    link: item.link,
+    p_local: Array.isArray(item.p_local) ? [...item.p_local] : [...item.p_hand],
+    p_hand: [...item.p_hand],
+    meshFaceIndex: item.meshFaceIndex,
+  }
+}
+
+function savedModelDraftsForHand(handId) {
+  const byId = new Map()
+  for (const sample of mountSamples.value) {
+    if (
+      sample.hand_id === handId
+      && mountSlots.some((slot) => slot.point_id === sample.point_id)
+      && Array.isArray(sample.p_hand)
+      && sample.p_hand.length === 3
+    ) {
+      byId.set(sample.point_id, modelOnlyMountDraft(sample))
+    }
+  }
+  return mountSlots
+    .map((slot) => byId.get(slot.point_id))
+    .filter(Boolean)
+}
+
+function keepOnlyMountModelPoints() {
+  mountDrafts.value = mountDrafts.value
+    .filter((item) => Array.isArray(item.p_hand))
+    .map(modelOnlyMountDraft)
+}
+
+function chooseNextMountModelSlot() {
+  const next = mountSlots.find((slot) => !mountDraftIds.value.has(slot.point_id))
+  if (next) activeMountSlotId.value = next.point_id
+  return next
+}
+
+function chooseNextMountCloudSlot() {
   const next = mountSlots.find((slot) =>
     !mountPairedIds.value.has(slot.point_id) && !mountSavedIds.value.has(slot.point_id),
   )
   if (next) {
     activeMountSlotId.value = next.point_id
-    mountViewport.value = 'model'
+    mountViewport.value = 'cloud'
   }
+  return next
+}
+
+function beginMountCloudPairing() {
+  if (!allMountModelPointsSelected.value) {
+    mountViewport.value = 'model'
+    infoMsg.value = `请先标完 16 个模型点，当前已完成 ${mountDraftIds.value.size} 个`
+    return
+  }
+  if (!selectedEpisode.value || !cloudId.value) {
+    infoMsg.value = '请先选择并加载一个 episode 点云'
+    return
+  }
+  mountViewport.value = 'cloud'
+  const next = chooseNextMountCloudSlot()
+  infoMsg.value = next
+    ? `模型 16 点已完成，请在当前 episode 点云选择 ${next.label}`
+    : '当前 episode 的可见点已配对；可保存或选择其他 episode'
 }
 
 function removeSelection(color) {
@@ -747,7 +818,10 @@ async function loadHandModel() {
     }
     if (serial !== handLoadSerial) return
     handModel.value = payload
-    mountDrafts.value = []
+    mountDrafts.value = savedModelDraftsForHand(payload.hand_id)
+    activeMountSlotId.value = mountSlots.find(
+      (slot) => !mountDraftIds.value.has(slot.point_id),
+    )?.point_id || mountSlots[0].point_id
     mountResult.value = null
     overlayVisible.value = false
     clearGroup(handMeshGroup)
@@ -770,7 +844,9 @@ async function loadHandModel() {
     refreshHighlights()
     refreshHandPointMarkers()
     frameHandModel()
-    infoMsg.value = `${payload.label} 全零关节模型已加载`
+    infoMsg.value = mountDraftIds.value.size
+      ? `${payload.label} 已恢复 ${mountDraftIds.value.size} 个模型点，请继续完成 16 点标注`
+      : `${payload.label} 全零关节模型已加载，请先连续标注 16 个模型点`
   } catch (error) {
     if (serial === handLoadSerial) setError(error)
   } finally {
@@ -781,15 +857,17 @@ async function loadHandModel() {
 function activateMountSlot(pointId) {
   activeMountSlotId.value = pointId
   const draft = mountDrafts.value.find((item) => item.point_id === pointId)
-  if (draft?.p_hand && draft.vertexIndex == null) {
-    mountViewport.value = 'cloud'
-    infoMsg.value = `${draft.label} 已有模型点，请在点云点击同序实体点`
-  } else if (draft?.vertexIndex != null || mountSavedIds.value.has(pointId)) {
+  if (mountViewport.value === 'model') {
+    infoMsg.value = draft?.p_hand
+      ? `${draft.label} 模型点已选；再次点击 mesh 可修正`
+      : `请在零位手模型上标注 ${mountSlotInfo(pointId).label}`
+  } else if (!draft?.p_hand) {
     mountViewport.value = 'model'
-    infoMsg.value = `${mountSlotInfo(pointId).label} 已完成；可重新点击模型和点云后覆盖`
+    infoMsg.value = `${mountSlotInfo(pointId).label} 尚未标注模型点`
+  } else if (draft.vertexIndex != null || mountSavedIds.value.has(pointId)) {
+    infoMsg.value = `${draft.label} 点云点已完成；再次点击点云可覆盖`
   } else {
-    mountViewport.value = 'model'
-    infoMsg.value = `当前槽：${mountSlotInfo(pointId).label}，请先点击零位手模型表面`
+    infoMsg.value = `请在当前 episode 点云选择 ${draft.label}`
   }
   refreshHandPointMarkers()
 }
@@ -821,6 +899,7 @@ function onHandPointerUp(event) {
   }
 
   const slot = activeMountSlot.value
+  const existing = activeMountDraft.value
   const pHand = hit.point.clone()
   const pLocal = pHand.clone().applyMatrix4(
     hit.object.userData.THandLink.clone().invert(),
@@ -829,30 +908,48 @@ function onHandPointerUp(event) {
     ...mountDrafts.value.filter((item) => item.point_id !== slot.point_id),
     {
       ...slot,
+      vertexIndex: existing?.vertexIndex,
+      point: existing?.point,
+      displayPoint: existing?.displayPoint,
       link: hit.object.userData.link,
       p_local: pLocal.toArray(),
       p_hand: pHand.toArray(),
       meshFaceIndex: hit.faceIndex,
     },
   ]
-  mountViewport.value = 'cloud'
-  infoMsg.value = `${slot.label} 模型点已选，请在当前 episode 点云点击同序实体点`
+  const next = chooseNextMountModelSlot()
+  infoMsg.value = next
+    ? `${slot.label} 模型点已选；下一项：${next.label}`
+    : '16 个模型点已全部标注，请点击“开始当前 episode 点云配对”'
   refreshHighlights()
   refreshHandPointMarkers()
 }
 
 function removeMountDraft(pointId) {
-  mountDrafts.value = mountDrafts.value.filter((item) => item.point_id !== pointId)
+  const draft = mountDrafts.value.find((item) => item.point_id === pointId)
+  mountDrafts.value = [
+    ...mountDrafts.value.filter((item) => item.point_id !== pointId),
+    ...(draft?.p_hand ? [modelOnlyMountDraft(draft)] : []),
+  ]
   activeMountSlotId.value = pointId
-  mountViewport.value = 'model'
+  mountViewport.value = 'cloud'
   refreshHighlights()
   refreshHandPointMarkers()
 }
 
 function clearMountDrafts() {
   mountDrafts.value = []
+  activeMountSlotId.value = mountSlots[0].point_id
+  mountViewport.value = 'model'
   refreshHighlights()
   refreshHandPointMarkers()
+}
+
+function clearMountCloudSelections() {
+  keepOnlyMountModelPoints()
+  refreshHighlights()
+  refreshHandPointMarkers()
+  infoMsg.value = '已撤销当前 episode 尚未保存的点云选择；16 个模型点仍保留'
 }
 
 async function loadHandsCatalog() {
@@ -922,12 +1019,12 @@ async function saveMountSelections() {
     })
     if (!saveResponse.ok) throw await responseError(saveResponse, '安装样本保存失败')
     const saved = await saveResponse.json()
-    mountDrafts.value = []
+    keepOnlyMountModelPoints()
     mountResult.value = null
     overlayVisible.value = false
     clearOverlay()
     await refreshMountSamples()
-    chooseNextMountSlot()
+    chooseNextMountCloudSlot()
     refreshHighlights()
     infoMsg.value = `已保存 ${saved.saved_count} 个安装配对，本会话共 ${saved.count} 条`
   } catch (error) {
@@ -1312,7 +1409,9 @@ onBeforeUnmount(() => {
             </button>
             <button
               :class="{ active: mountViewport === 'cloud' }"
-              @click="mountViewport = 'cloud'"
+              :disabled="!allMountModelPointsSelected"
+              title="标完 16 个模型点后进入点云配对"
+              @click="beginMountCloudPairing"
             >
               实体点云
             </button>
@@ -1350,7 +1449,14 @@ onBeforeUnmount(() => {
             <span class="y">Y 下</span>
             <span class="z">Z 前</span>
           </div>
-          <div class="viewer-help">单击选点 · 左键拖动旋转 · 右键平移 · 滚轮缩放</div>
+          <div class="viewer-help">
+            {{
+              mode === 'mount'
+                ? `当前 ${activeMountSlot?.label || '未选槽位'} · 单击对应实体点`
+                : '单击选点'
+            }}
+            · 左键拖动旋转 · 右键平移 · 滚轮缩放
+          </div>
         </div>
         <div
           v-show="mode === 'mount' && mountViewport === 'model'"
@@ -1409,8 +1515,10 @@ onBeforeUnmount(() => {
           <section class="side-card mount-slots-card">
             <div class="panel-heading compact">
               <div>
-                <h2>2. 依次配对 16 个有序槽</h2>
-                <span>手心红点 01–08 · 手背绿点 01–08</span>
+                <h2>2. 先标注手模型的 16 个点</h2>
+                <span>
+                  已完成 {{ mountDraftIds.size }}/16 · 全部完成后再进入点云
+                </span>
               </div>
             </div>
             <div class="mount-slot-section">
@@ -1426,13 +1534,16 @@ onBeforeUnmount(() => {
                     paired: mountPairedIds.has(slot.point_id),
                     saved: mountSavedIds.has(slot.point_id),
                   }"
+                  :title="`${slot.label}（${slot.point_id}）`"
                   @click="activateMountSlot(slot.point_id)"
                 >
                   <i :style="{ background: slot.color }"></i>
-                  <span>{{ slot.point_id }}</span>
+                  <span>{{ slot.shortLabel }}</span>
                   <small v-if="mountPairedIds.has(slot.point_id)">待保存</small>
                   <small v-else-if="mountSavedIds.has(slot.point_id)">已保存</small>
-                  <small v-else-if="mountDraftIds.has(slot.point_id)">点云待选</small>
+                  <small v-else-if="mountDraftIds.has(slot.point_id)">
+                    {{ mountViewport === 'cloud' ? '点云待选' : '模型已选' }}
+                  </small>
                   <small v-else>模型待选</small>
                 </button>
               </div>
@@ -1450,41 +1561,64 @@ onBeforeUnmount(() => {
                     paired: mountPairedIds.has(slot.point_id),
                     saved: mountSavedIds.has(slot.point_id),
                   }"
+                  :title="`${slot.label}（${slot.point_id}）`"
                   @click="activateMountSlot(slot.point_id)"
                 >
                   <i :style="{ background: slot.color }"></i>
-                  <span>{{ slot.point_id }}</span>
+                  <span>{{ slot.shortLabel }}</span>
                   <small v-if="mountPairedIds.has(slot.point_id)">待保存</small>
                   <small v-else-if="mountSavedIds.has(slot.point_id)">已保存</small>
-                  <small v-else-if="mountDraftIds.has(slot.point_id)">点云待选</small>
+                  <small v-else-if="mountDraftIds.has(slot.point_id)">
+                    {{ mountViewport === 'cloud' ? '点云待选' : '模型已选' }}
+                  </small>
                   <small v-else>模型待选</small>
                 </button>
               </div>
             </div>
             <p class="armed-hint">
               当前：<strong>{{ activeMountSlot?.label }}</strong>
-              <template v-if="activeMountDraft?.p_hand && activeMountDraft?.vertexIndex == null">
-                → 模型点已选，请点击当前 episode 点云
+              <template v-if="mountViewport === 'model'">
+                → 请在手模型上点击此点
               </template>
-              <template v-else>→ 请先点击模型 mesh，再点击点云</template>
+              <template v-else>→ 请在当前 episode 点云点击对应实体点</template>
             </p>
+            <div class="mount-stage-actions">
+              <button
+                class="primary-button"
+                :disabled="!allMountModelPointsSelected"
+                @click="beginMountCloudPairing"
+              >
+                开始当前 episode 点云配对
+              </button>
+              <button
+                class="text-button"
+                :disabled="!mountDraftIds.size"
+                @click="clearMountDrafts"
+              >
+                清空模型点
+              </button>
+            </div>
           </section>
 
           <section class="side-card grow">
             <div class="panel-heading compact">
               <div>
-                <h2>3. 本姿态待保存配对</h2>
+                <h2>3. 当前 episode 点云配对</h2>
                 <span>
                   {{ mountPairedIds.size }} 对待保存 · {{ mountSavedForEpisode.length }} 对已保存
                 </span>
               </div>
-              <button class="text-button" :disabled="!mountDrafts.length" @click="clearMountDrafts">
-                撤销全部
+              <button
+                class="text-button"
+                :disabled="!mountPairedDrafts.length"
+                @click="clearMountCloudSelections"
+              >
+                撤销点云选择
               </button>
             </div>
             <div class="selection-list mount-selection-list">
               <article
-                v-for="item in mountDrafts"
+                v-for="item in mountPairedDrafts"
                 :key="item.point_id"
                 class="selection-row"
               >
@@ -1502,9 +1636,9 @@ onBeforeUnmount(() => {
                 </div>
                 <button title="撤销此槽" @click="removeMountDraft(item.point_id)">×</button>
               </article>
-              <p v-if="!mountDrafts.length" class="empty-state">
-                每个槽都要先在零位手模型 mesh 上点击，再在点云点击同序实体点。
-                单个 episode 不必看到全部 16 点。
+              <p v-if="!mountPairedDrafts.length" class="empty-state">
+                先完成上方 16 个模型点，再进入当前 episode 点云配对可见实体点。
+                单个 episode 不要求看见全部 16 点。
               </p>
             </div>
             <button class="primary-button" :disabled="!canSaveMount" @click="saveMountSelections">
