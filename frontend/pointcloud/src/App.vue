@@ -1644,6 +1644,12 @@ async function setMode(nextMode) {
     if (overlayGroup) overlayGroup.visible = false
     return
   }
+  await enterMountMode()
+}
+
+// 手安装模式的初始化：手型号目录、模型点方案、样本、解算结果。
+// 默认模式就是 mount，所以页面打开时也要跑一遍，不能只靠 setMode 切换触发。
+async function enterMountMode() {
   await nextTick()
   initHandViewer()
   resizeHandViewer()
@@ -1878,6 +1884,7 @@ onMounted(async () => {
   }, 5000)
   await loadWorkspace()
   await loadEpisodeTasks()
+  if (mode.value === 'mount') await enterMountMode()
   if (selectedEpisode.value) await loadPointCloud()
 })
 
