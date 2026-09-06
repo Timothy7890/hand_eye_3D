@@ -1192,19 +1192,29 @@ class OfflineEpisodeBackend:
                     f"第 {position} 个 selection 缺少非空 point_id"
                 )
             try:
-                p_hand = np.asarray(selection["p_hand"], dtype=float).reshape(3)
-                p_local = np.asarray(
-                    selection.get("p_local", p_hand), dtype=float
-                ).reshape(3)
+                # 模型点可缺：实体点先单独保存，模型点之后再补
+                raw_p_hand = selection.get("p_hand")
+                p_hand = (
+                    None
+                    if raw_p_hand is None
+                    else np.asarray(raw_p_hand, dtype=float).reshape(3)
+                )
+                raw_p_local = selection.get("p_local")
+                p_local = (
+                    p_hand
+                    if raw_p_local is None
+                    else np.asarray(raw_p_local, dtype=float).reshape(3)
+                )
                 vertex_index = int(selection["vertex_index"])
             except (KeyError, TypeError, ValueError) as exc:
                 raise EpisodeValidationError(
                     f"第 {position} 个 selection 的模型点或 vertex_index 不合法"
                 ) from exc
-            if not np.all(np.isfinite(p_hand)) or not np.all(np.isfinite(p_local)):
-                raise EpisodeValidationError(
-                    f"第 {position} 个 selection 的模型点包含非法值"
-                )
+            for vec in (p_hand, p_local):
+                if vec is not None and not np.all(np.isfinite(vec)):
+                    raise EpisodeValidationError(
+                        f"第 {position} 个 selection 的模型点包含非法值"
+                    )
             if vertex_index < 0 or vertex_index >= len(cloud.points):
                 raise EpisodeValidationError(
                     f"第 {position} 个 selection 的 vertex_index {vertex_index} 越界，"
@@ -1215,8 +1225,8 @@ class OfflineEpisodeBackend:
                     "point_id": point_id.strip(),
                     "label": str(selection.get("label") or point_id.strip()),
                     "link": selection.get("link"),
-                    "p_local": p_local.tolist(),
-                    "p_hand": p_hand.tolist(),
+                    "p_local": None if p_local is None else p_local.tolist(),
+                    "p_hand": None if p_hand is None else p_hand.tolist(),
                     "vertex_index": vertex_index,
                 }
             )

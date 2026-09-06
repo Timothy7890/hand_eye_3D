@@ -186,6 +186,23 @@ const mountCloudOnlyIds = computed(() =>
 const mountSavedIds = computed(() =>
   new Set(mountSavedForEpisode.value.map((item) => item.point_id)),
 )
+// 已保存但只有实体点、还没有模型点的样本（保存实体点时模型点尚未标）
+const hasModelPoint = (sample) => Array.isArray(sample?.p_hand) && sample.p_hand.length === 3
+const mountSavedMissingModelIds = computed(() =>
+  new Set(mountSavedForEpisode.value.filter((s) => !hasModelPoint(s)).map((s) => s.point_id)),
+)
+const mountSamplesMissingModel = computed(() =>
+  mountSamples.value.filter((s) => !hasModelPoint(s)).length,
+)
+// 当前手型号已保存样本里、能被当前模型点草稿补上/更新的条数
+const mountSamplesApplicable = computed(() =>
+  mountSamples.value.filter(
+    (s) => s.hand_id === selectedHandId.value && mountDraftIds.value.has(s.point_id),
+  ).length,
+)
+const canApplyModelPoints = computed(() =>
+  mountDraftIds.value.size > 0 && mountSamplesApplicable.value > 0 && !mountProfileBusy.value,
+)
 const activeMountDraft = computed(() =>
   mountDrafts.value.find((item) => item.point_id === activeMountSlotId.value) || null,
 )
@@ -206,7 +223,7 @@ const canSave = computed(() =>
   && Boolean(selectedEpisode.value),
 )
 const canSaveMount = computed(() =>
-  mountPairedDrafts.value.length > 0
+  mountCloudPickedIds.value.size > 0
   && !cloudBusy.value
   && !mountSaveBusy.value
   && Boolean(selectedEpisode.value)
@@ -840,22 +857,62 @@ function selectMountProfile() {
   }
 }
 
+function currentModelPoints() {
+  return mountSlots.flatMap((slot) => {
+    const draft = mountDrafts.value.find((item) => item.point_id === slot.point_id)
+    if (!draft?.p_hand) return []
+    return [{
+      point_id: slot.point_id,
+      label: slot.label,
+      link: draft.link,
+      p_local: draft.p_local,
+      p_hand: draft.p_hand,
+    }]
+  })
+}
+
+// 模型点是"每种手一份"，实体点是"每个 episode 一份"，二者独立保存；这里把当前模型点合并进已保存样本。
+async function applyModelPointsToSamples({ silent = false } = {}) {
+  const points = currentModelPoints()
+  if (!points.length || !selectedHandId.value) return null
+  const response = await fetch('/api/mount/samples/apply-model-points', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ hand_id: selectedHandId.value, points }),
+  })
+  if (!response.ok) throw await responseError(response, '模型点写入已保存样本失败')
+  const data = await response.json()
+  if (data.updated) {
+    await refreshMountSamples()
+    mountResult.value = null
+  }
+  if (!silent) {
+    infoMsg.value = data.updated
+      ? `模型点已写入 ${data.updated} 条已保存样本（补齐 ${data.filled} 条）${data.still_missing ? `，仍有 ${data.still_missing} 条缺模型点` : ''}`
+      : '已保存样本的模型点与当前一致，无需更新'
+  }
+  return data
+}
+
+async function applyModelPoints() {
+  if (!canApplyModelPoints.value) return
+  mountProfileBusy.value = true
+  errorMsg.value = ''
+  try {
+    await applyModelPointsToSamples()
+  } catch (error) {
+    setError(error)
+  } finally {
+    mountProfileBusy.value = false
+  }
+}
+
 async function saveMountProfile() {
   if (!canSaveMountProfile.value) return
   mountProfileBusy.value = true
   errorMsg.value = ''
   try {
-    const points = mountSlots.flatMap((slot) => {
-      const draft = mountDrafts.value.find((item) => item.point_id === slot.point_id)
-      if (!draft?.p_hand) return []
-      return [{
-        point_id: slot.point_id,
-        label: slot.label,
-        link: draft.link,
-        p_local: draft.p_local,
-        p_hand: draft.p_hand,
-      }]
-    })
+    const points = currentModelPoints()
     const response = await fetch('/api/mount/model-point-profiles', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -876,6 +933,9 @@ async function saveMountProfile() {
     infoMsg.value = data.created
       ? `模型点方案“${data.profile.name}”已保存（${data.profile.point_count}/${mountSlots.length}）`
       : `模型点方案“${data.profile.name}”已覆盖（${data.profile.point_count}/${mountSlots.length}）`
+    // 保存模型点修改的同时，同步到该手型号已保存的样本
+    const applied = await applyModelPointsToSamples({ silent: true })
+    if (applied?.updated) infoMsg.value += `；已同步写入 ${applied.updated} 条已保存样本`
   } catch (error) {
     setError(error)
   } finally {
@@ -1433,6 +1493,16 @@ async function saveMountSelections() {
   try {
     const paired = mountDrafts.value.filter((item) => item.vertexIndex != null)
     const savedEpisode = selectedEpisode.value
+    // 实体点单独保存：模型点没标就存 null；若是重选同槽实体点，沿用旧样本里的模型点
+    const previousById = new Map(mountSavedForEpisode.value.map((item) => [item.point_id, item]))
+    const modelFor = (item) => {
+      if (Array.isArray(item.p_hand)) return { p_hand: item.p_hand, p_local: item.p_local, link: item.link }
+      const previous = previousById.get(item.point_id)
+      if (hasModelPoint(previous)) {
+        return { p_hand: previous.p_hand, p_local: previous.p_local ?? null, link: previous.link ?? null }
+      }
+      return { p_hand: null, p_local: null, link: item.link ?? null }
+    }
     const confirmResponse = await fetch('/api/offline/confirm-mount-points', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1445,9 +1515,7 @@ async function saveMountSelections() {
         selections: paired.map((item) => ({
           point_id: item.point_id,
           label: item.label,
-          link: item.link,
-          p_local: item.p_local,
-          p_hand: item.p_hand,
+          ...modelFor(item),
           vertex_index: item.vertexIndex,
         })),
       }),
@@ -1526,7 +1594,10 @@ async function saveMountSelections() {
     refreshHandPointMarkers()
     chooseNextMountCloudSlot()
     refreshHighlights()
-    infoMsg.value = `已保存 ${saved.saved_count} 个安装配对，本会话共 ${saved.count} 条`
+    const missingNow = confirmation.observations.filter((o) => !hasModelPoint(o)).length
+    infoMsg.value = missingNow
+      ? `已保存 ${saved.saved_count} 个实体点（其中 ${missingNow} 个还没有模型点，标好模型点后点「写入已保存样本」即可补齐），本会话共 ${saved.count} 条`
+      : `已保存 ${saved.saved_count} 个安装配对，本会话共 ${saved.count} 条`
   } catch (error) {
     setError(error)
   } finally {
@@ -2244,7 +2315,8 @@ onBeforeUnmount(() => {
                     <i :style="{ background: slot.color }"></i>
                     <span>{{ slot.shortLabel }}</span>
                     <small v-if="mountPairedIds.has(slot.point_id)">待保存</small>
-                    <small v-else-if="mountCloudOnlyIds.has(slot.point_id)" class="missing-model">缺模型点</small>
+                    <small v-else-if="mountCloudOnlyIds.has(slot.point_id)" class="missing-model">待保存·缺模型点</small>
+                    <small v-else-if="mountSavedMissingModelIds.has(slot.point_id)" class="missing-model">已保存·缺模型点</small>
                     <small v-else-if="mountSavedIds.has(slot.point_id)">已保存</small>
                     <small v-else-if="mountDraftIds.has(slot.point_id)">
                       {{ mountViewport === 'cloud' ? '点云待选' : '模型已选' }}
@@ -2286,6 +2358,15 @@ onBeforeUnmount(() => {
                 去点云选实体点
               </button>
               <button
+                v-if="mountViewport === 'model'"
+                class="secondary-button"
+                :disabled="!canApplyModelPoints"
+                :title="mountSamplesApplicable ? `把当前模型点写入 ${mountSamplesApplicable} 条已保存样本` : '没有可更新的已保存样本'"
+                @click="applyModelPoints"
+              >
+                {{ mountProfileBusy ? '写入中…' : `写入已保存样本（${mountSamplesApplicable}）` }}
+              </button>
+              <button
                 class="text-button"
                 :disabled="!mountDraftIds.size"
                 @click="clearMountDrafts"
@@ -2300,8 +2381,8 @@ onBeforeUnmount(() => {
               <div>
                 <h2>4. 当前 episode 实体点</h2>
                 <span>
-                  {{ mountPairedIds.size }} 对待保存 · {{ mountSavedForEpisode.length }} 对已保存
-                  <template v-if="mountCloudOnlyIds.size"> · {{ mountCloudOnlyIds.size }} 个实体点缺模型点</template>
+                  {{ mountCloudPickedIds.size }} 个待保存 · {{ mountSavedForEpisode.length }} 个已保存
+                  <template v-if="mountSavedMissingModelIds.size"> · 已保存中 {{ mountSavedMissingModelIds.size }} 个缺模型点</template>
                 </span>
               </div>
               <button
@@ -2316,12 +2397,12 @@ onBeforeUnmount(() => {
               {{
                 mountSaveBusy
                   ? mountSaveStatus
-                  : `保存当前已选 ${mountPairedDrafts.length} 个实体点`
+                  : `保存当前所选 ${mountCloudPickedIds.size} 个点云点`
               }}
             </button>
             <p class="mount-save-hint">
-              选中 1 对即可保存；无需在当前 episode 看齐所有点。
-              <template v-if="mountCloudOnlyIds.size">只有实体点、还缺模型点的槽位不会被保存，请到「零位手模型」补上。</template>
+              点云点可单独保存，选 1 个即可，无需凑齐。
+              <template v-if="mountCloudOnlyIds.size">其中 {{ mountCloudOnlyIds.size }} 个还没有模型点，会先按"缺模型点"保存；到「零位手模型」标好后点「写入已保存样本」补齐。</template>
             </p>
           </section>
 
@@ -2329,7 +2410,10 @@ onBeforeUnmount(() => {
             <div class="panel-heading compact">
               <div>
                 <h2>5. 安装样本与解算</h2>
-                <span>{{ mountSamples.length }} 条样本 · {{ mountSamplesByPose }} 个姿态</span>
+                <span>
+                  {{ mountSamples.length }} 条样本 · {{ mountSamplesByPose }} 个姿态
+                  <template v-if="mountSamplesMissingModel"> · <b class="missing-model">{{ mountSamplesMissingModel }} 条缺模型点（解算跳过）</b></template>
+                </span>
               </div>
             </div>
             <div class="mount-calib-picker">

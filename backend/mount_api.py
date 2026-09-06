@@ -223,6 +223,18 @@ def _load_mount_samples() -> list[dict]:
     return items
 
 
+def _has_model_point(sample: dict) -> bool:
+    p_hand = sample.get("p_hand")
+    return isinstance(p_hand, (list, tuple)) and len(p_hand) == 3
+
+
+def _split_mount_samples(samples: list[dict]) -> tuple[list[dict], list[dict]]:
+    """→ (有模型点、可参与解算的样本, 只有实体点、缺模型点的样本)"""
+    solvable = [s for s in samples if _has_model_point(s)]
+    missing = [s for s in samples if not _has_model_point(s)]
+    return solvable, missing
+
+
 def _next_mount_index() -> int:
     used = [int(p.stem) for p in _mount_dir().glob("*.json") if p.stem.isdigit()]
     return (max(used) + 1) if used else 0
@@ -932,12 +944,19 @@ def _validated_mount_observation(observation: dict, position: int) -> dict:
             raise ValueError(f"第 {position} 个 observation 缺少非空 {key}")
     point_id = _validate_mount_point_id(observation.get("point_id"), position)
     try:
-        p_hand = np.asarray(observation["p_hand"], dtype=float).reshape(3)
+        # 实体点（p_camera）可以先于模型点（p_hand）单独保存；p_hand 缺失时记为 None，
+        # 之后通过 /api/mount/samples/apply-model-points 补齐。解算只用有 p_hand 的样本。
+        raw_p_hand = observation.get("p_hand")
+        p_hand = (
+            None if raw_p_hand is None else np.asarray(raw_p_hand, dtype=float).reshape(3)
+        )
         p_camera = np.asarray(observation["p_camera"], dtype=float).reshape(3)
         T_wrist = state._parse_wrist_pose(observation)
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"第 {position} 个 observation 坐标/位姿不合法: {exc}") from exc
-    if not np.all(np.isfinite(p_hand)) or not np.all(np.isfinite(p_camera)):
+    if p_hand is not None and not np.all(np.isfinite(p_hand)):
+        raise ValueError(f"第 {position} 个 observation 模型点坐标包含非法值")
+    if not np.all(np.isfinite(p_camera)):
         raise ValueError(f"第 {position} 个 observation 坐标包含非法值")
     if not (MOUNT_DEPTH_MIN_M <= float(p_camera[2]) <= MOUNT_DEPTH_MAX_M):
         raise ValueError(
@@ -977,7 +996,7 @@ def _validated_mount_observation(observation: dict, position: int) -> dict:
             "point_id": point_id,
             "hand_id": str(observation["hand_id"]).strip(),
             "pose_id": str(observation["pose_id"]).strip(),
-            "p_hand": p_hand.tolist(),
+            "p_hand": None if p_hand is None else p_hand.tolist(),
             "p_camera": p_camera.tolist(),
             "T_base_wrist": T_wrist.tolist(),
         }
@@ -988,10 +1007,79 @@ def _validated_mount_observation(observation: dict, position: int) -> dict:
 @router.get("/api/mount/samples")
 async def api_mount_samples():
     items = _load_mount_samples()
+    _, missing = _split_mount_samples(items)
     return {
         "samples": items,
         "count": len(items),
+        "missing_model_points": len(missing),
         "min_points": MIN_MOUNT_POINTS,
+    }
+
+
+@router.post("/api/mount/samples/apply-model-points")
+async def api_mount_samples_apply_model_points(body: dict):
+    """把当前手模型上标注的模型点写入该手型号已保存的样本（补齐缺失、覆盖旧值）。
+
+    模型点是"每种手一份"的量，实体点是"每个 episode 一份"；二者独立保存，这里做合并。
+    """
+    state = _state()
+    try:
+        hand_id = body["hand_id"]
+        points = body["points"]
+        if not isinstance(hand_id, str) or not hand_id.strip():
+            raise ValueError("hand_id 必须是非空字符串")
+        if not isinstance(points, list) or not points:
+            raise ValueError("points 必须是非空数组")
+        model_points: dict[str, dict] = {}
+        for position, point in enumerate(points):
+            if not isinstance(point, dict):
+                raise ValueError(f"第 {position} 个 point 必须是 JSON object")
+            point_id = _validate_mount_point_id(point.get("point_id"), position)
+            p_hand = np.asarray(point["p_hand"], dtype=float).reshape(3)
+            if not np.all(np.isfinite(p_hand)):
+                raise ValueError(f"第 {position} 个 point 的 p_hand 包含非法值")
+            entry = {"p_hand": p_hand.tolist()}
+            if point.get("p_local") is not None:
+                entry["p_local"] = np.asarray(point["p_local"], dtype=float).reshape(3).tolist()
+            if point.get("link") is not None:
+                entry["link"] = str(point["link"])
+            if point.get("label"):
+                entry["label"] = str(point["label"])
+            model_points[point_id] = entry
+    except (KeyError, TypeError, ValueError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc) or "参数不合法"}, status_code=400)
+
+    hand_id = hand_id.strip()
+    updated = filled = 0
+    with state.samples_lock:
+        for path in sorted(_mount_dir().glob("*.json")):
+            try:
+                sample = json.loads(path.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if sample.get("hand_id") != hand_id:
+                continue
+            entry = model_points.get(sample.get("point_id"))
+            if entry is None:
+                continue
+            was_missing = not _has_model_point(sample)
+            if not was_missing and sample.get("p_hand") == entry["p_hand"] and all(
+                sample.get(k) == v for k, v in entry.items()
+            ):
+                continue
+            sample.update(entry)
+            sample["model_points_applied_at"] = datetime.now().isoformat(timespec="seconds")
+            path.write_text(json.dumps(sample, indent=2, ensure_ascii=False))
+            updated += 1
+            filled += int(was_missing)
+        samples = _load_mount_samples()
+    _, still_missing = _split_mount_samples(samples)
+    return {
+        "ok": True,
+        "updated": updated,
+        "filled": filled,
+        "still_missing": len(still_missing),
+        "count": len(samples),
     }
 
 
@@ -1143,6 +1231,7 @@ def _best_same_color_swap(
     observed_wrist: list[np.ndarray],
 ) -> dict[str, Any]:
     point_by_id: dict[str, np.ndarray] = {}
+    samples = [s for s in samples if _has_model_point(s)]
     for sample in samples:
         point_by_id.setdefault(
             sample["point_id"], np.asarray(sample["p_hand"], dtype=float)
@@ -1227,6 +1316,7 @@ async def api_mount_diagnostics():
             {"ok": False, "error": f"安装标定诊断数据无法读取: {exc}"},
             status_code=500,
         )
+    samples, _ = _split_mount_samples(samples)
     if not samples:
         return {"available": False, "reason": "安装样本已被清空"}
 
@@ -1369,6 +1459,16 @@ async def api_mount_solve(body: dict | None = None):
         return JSONResponse(
             {"ok": False, "error": "没有手安装标定样本"}, status_code=400
         )
+    samples, missing_model = _split_mount_samples(samples)
+    if not samples:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": f"{len(missing_model)} 条样本只有实体点、没有模型点；"
+                "请在「零位手模型」标注模型点后点「写入已保存样本」再解算",
+            },
+            status_code=400,
+        )
     try:
         samples = [
             _validated_mount_observation(sample, position)
@@ -1462,6 +1562,11 @@ async def api_mount_solve(body: dict | None = None):
     result["calib_camera"] = calib_identity
     result["active_combo"] = _active_combo_payload(capability)
     result["warnings"] = [capability_warning] if capability_warning else []
+    if missing_model:
+        result["warnings"].append(
+            f"{len(missing_model)} 条样本缺模型点，本次解算已跳过"
+        )
+    result["skipped_missing_model_points"] = len(missing_model)
     result["base_link"] = samples[0].get("base_link")
     result["wrist_link"] = samples[0].get("wrist_link")
     result["arm"] = samples[0].get("arm")
