@@ -22,15 +22,15 @@ const solveBusy = ref(false)
 const errorMsg = ref('')
 const infoMsg = ref('')
 const cloudId = ref('')
-const cloudStride = ref(2)
+const cloudStride = ref(1)   // 默认精细
 const pointCount = ref(0)
-const pointSize = ref(4)
+const pointSize = ref(1)     // 默认最小点
 const solveResult = ref(null)
 const imageFrontendUrl = `${window.location.protocol}//${window.location.hostname}:7012`
 const mountDiagnosticsFrontendUrl = `${window.location.protocol}//${window.location.hostname}:7015`
 
 // 手安装标定分两阶段：先一次性标完 16 个模型点，再按 episode 配对点云点。
-const mode = ref('marker')
+const mode = ref('mount')    // 默认手安装标定
 const hands = ref([])
 const selectedHandId = ref('')
 const handModel = ref(null)

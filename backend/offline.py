@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uuid
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -643,19 +644,60 @@ class OfflineEpisodeBackend:
             ),
         )
 
+    # ---- 磁盘缓存：对齐深度栈与点云都由输入文件的 mtime/size + 标定 + stride 唯一决定，
+    # 以其 sha256 命名落在 episode 目录下的 .cache/，重启服务或切换 episode 都不用重算。
+    @staticmethod
+    def _cache_dir(episode: OfflineEpisode) -> Path:
+        return episode.frames[0].depth_path.parent.parent / ".cache"
+
+    @staticmethod
+    def _key_digest(key: tuple[Any, ...]) -> str:
+        return hashlib.sha256(repr(key).encode("utf-8")).hexdigest()[:24]
+
     def _aligned_depth_stack(self, episode: OfflineEpisode) -> np.ndarray:
-        """每帧只做一次软件对齐，供同一批 marker 共享；同一 episode 复用缓存。"""
+        """每帧只做一次软件对齐，供同一批 marker 共享；内存 + 磁盘两级缓存。"""
         key = self._depth_cache_key(episode)
         cached = self._aligned_depth_cache.get(key)
         if cached is not None:
             return cached
-        aligned = []
-        for frame in episode.frames:
-            raw_depth = np.load(frame.depth_path, allow_pickle=False)
-            aligned.append(np.asarray(self.aligner.align(raw_depth), dtype=np.float32))
-        stack = np.stack(aligned, axis=0)
+        calib_stat = self.rgbd_calib_path.stat()
+        disk_key = (key, str(self.rgbd_calib_path), calib_stat.st_mtime_ns, calib_stat.st_size)
+        disk_path = self._cache_dir(episode) / f"aligned_depth_{self._key_digest(disk_key)}.npy"
+        stack = None
+        if disk_path.is_file():
+            try:
+                stack = np.load(disk_path, allow_pickle=False)
+                if stack.ndim != 3 or stack.shape[0] != len(episode.frames):
+                    stack = None
+            except (OSError, ValueError):
+                stack = None
+        if stack is None:
+            aligned = []
+            for frame in episode.frames:
+                raw_depth = np.load(frame.depth_path, allow_pickle=False)
+                aligned.append(np.asarray(self.aligner.align(raw_depth), dtype=np.float32))
+            stack = np.stack(aligned, axis=0)
+            self._write_cache(disk_path, lambda tmp: np.save(tmp, stack, allow_pickle=False))
         self._aligned_depth_cache = {key: stack}
         return stack
+
+    @staticmethod
+    def _write_cache(path: Path, writer) -> None:
+        """原子写入；缓存写失败（只读目录等）不影响主流程。"""
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+            writer(tmp)
+            # np.save / np.savez 会给不带对应后缀的文件名自动补 .npy / .npz
+            if not tmp.exists():
+                for suffix in (".npy", ".npz"):
+                    candidate = tmp.with_name(tmp.name + suffix)
+                    if candidate.exists():
+                        tmp = candidate
+                        break
+            tmp.replace(path)
+        except OSError:
+            pass
 
     def _point_cloud_cache_key(
         self, episode: OfflineEpisode, stride: int
@@ -682,6 +724,24 @@ class OfflineEpisodeBackend:
         cached = self._point_cloud_cache.get(key)
         if cached is not None:
             return cached
+        cloud_id = self._key_digest(key)
+        disk_path = self._cache_dir(episode) / f"point_cloud_s{stride}_{cloud_id}.npz"
+        if disk_path.is_file():
+            try:
+                with np.load(disk_path, allow_pickle=False) as data:
+                    cloud = OfflinePointCloud(
+                        cloud_id=cloud_id,
+                        stride=stride,
+                        points=np.asarray(data["points"], dtype=np.float32),
+                        colors=np.asarray(data["colors"], dtype=np.uint8),
+                        pixels=np.asarray(data["pixels"], dtype=np.int32),
+                        valid_depth_frames=np.asarray(data["valid_depth_frames"], dtype=np.uint8),
+                        depth_spread_mm=np.asarray(data["depth_spread_mm"], dtype=np.float32),
+                    )
+                self._point_cloud_cache = {key: cloud}
+                return cloud
+            except (OSError, ValueError, KeyError):
+                pass
 
         stack = self._aligned_depth_stack(episode)
         valid = (
@@ -731,7 +791,6 @@ class OfflineEpisodeBackend:
                 f"代表 RGB 图片无法用于点云着色: {episode.representative.color_path}"
             )
         colors = image[v, u, ::-1].astype(np.uint8, copy=True)
-        cloud_id = hashlib.sha256(repr(key).encode("utf-8")).hexdigest()[:24]
         cloud = OfflinePointCloud(
             cloud_id=cloud_id,
             stride=stride,
@@ -740,6 +799,13 @@ class OfflineEpisodeBackend:
             pixels=pixels,
             valid_depth_frames=valid_count[v, u].astype(np.uint8, copy=False),
             depth_spread_mm=spread_mm[v, u].astype(np.float32, copy=False),
+        )
+        self._write_cache(
+            disk_path,
+            lambda tmp: np.savez(
+                tmp, points=cloud.points, colors=cloud.colors, pixels=cloud.pixels,
+                valid_depth_frames=cloud.valid_depth_frames, depth_spread_mm=cloud.depth_spread_mm,
+            ),
         )
         self._point_cloud_cache = {key: cloud}
         return cloud

@@ -830,3 +830,51 @@ class EpisodeTaskSwitchTest(unittest.TestCase):
             for name, value in saved.items():
                 setattr(app_module, name, value)
 
+
+
+class PointCloudDiskCacheTest(unittest.TestCase):
+    def setUp(self):
+        self.patches = [
+            patch("backend.offline.RobotModel", _FakeRobotModel),
+            patch("backend.offline.load_robot_config", return_value={}),
+        ]
+        for item in self.patches:
+            item.start()
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.root = Path(self.tempdir.name)
+        self.calibration_path = self.root / "rgbd.json"
+        _write_calibration(self.calibration_path)
+        _write_episode(self.root, "episode_0001", [980, 1000, 1020, 1010, 990])
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+        for item in self.patches:
+            item.stop()
+
+    def test_point_cloud_and_aligned_depth_are_cached_on_disk(self):
+        backend = OfflineEpisodeBackend(self.root, self.calibration_path)
+        first = backend.point_cloud("episode_0001", stride=1)
+        cache_dir = self.root / "episode_0001" / ".cache"
+        npz = sorted(cache_dir.glob("point_cloud_s1_*.npz"))
+        npy = sorted(cache_dir.glob("aligned_depth_*.npy"))
+        self.assertEqual(len(npz), 1)
+        self.assertEqual(len(npy), 1)
+        self.assertFalse(list(cache_dir.glob(".*.tmp*")))
+
+        # 新实例（模拟重启）：直接从磁盘读，结果一致，不重新对齐
+        fresh = OfflineEpisodeBackend(self.root, self.calibration_path)
+        with patch.object(fresh.aligner, "align", side_effect=AssertionError("should not realign")):
+            second = fresh.point_cloud("episode_0001", stride=1)
+        self.assertEqual(second.cloud_id, first.cloud_id)
+        np.testing.assert_array_equal(second.points, first.points)
+        np.testing.assert_array_equal(second.colors, first.colors)
+        np.testing.assert_array_equal(second.pixels, first.pixels)
+
+        # 输入变了（深度文件被改写）→ 缓存键变化，重新计算并写新文件
+        depth = self.root / "episode_0001" / "depth" / "000002_head_depth.npy"
+        np.save(depth, np.full((3, 4), 1005, dtype=np.uint16), allow_pickle=False)
+        import os
+        os.utime(depth, ns=(depth.stat().st_atime_ns + 10**9, depth.stat().st_mtime_ns + 10**9))
+        third = OfflineEpisodeBackend(self.root, self.calibration_path).point_cloud("episode_0001", stride=1)
+        self.assertNotEqual(third.cloud_id, first.cloud_id)
+        self.assertEqual(len(list(cache_dir.glob("point_cloud_s1_*.npz"))), 2)
