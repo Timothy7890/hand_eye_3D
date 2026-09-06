@@ -2271,6 +2271,14 @@ onBeforeUnmount(() => {
             </p>
             <div class="mount-stage-actions">
               <button
+                v-if="mountViewport === 'cloud'"
+                class="primary-button"
+                @click="mountViewport = 'model'"
+              >
+                去零位手模型选理论点
+              </button>
+              <button
+                v-else
                 class="primary-button"
                 :disabled="!selectedEpisode"
                 @click="mountViewport = 'cloud'"
