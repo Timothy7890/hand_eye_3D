@@ -154,6 +154,54 @@ button {
   overflow-y: auto;
 }
 
+.episode-list.with-picker {
+  height: calc(100% - 48px - 92px);
+}
+
+.task-picker {
+  display: block;
+  padding: 0 6px 12px;
+}
+
+.task-picker > span {
+  display: block;
+  color: #c7d2e1;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  margin-bottom: 6px;
+}
+
+.task-picker select {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid #253247;
+  border-radius: 8px;
+  background: #0f1622;
+  color: #e6edf7;
+  font-size: 12px;
+}
+
+.task-picker small {
+  display: block;
+  margin-top: 4px;
+  color: #617087;
+  font-size: 10px;
+  word-break: break-all;
+  max-height: 26px;
+  overflow: hidden;
+}
+
+.arm-badge {
+  margin-left: 8px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  color: #fff;
+}
+
+.arm-badge.left { background: #2f5f9e; }
+.arm-badge.right { background: #9e5f2f; }
+
 .episode-item {
   width: 100%;
   display: flex;

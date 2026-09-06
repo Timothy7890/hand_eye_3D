@@ -8,6 +8,9 @@ import { STLLoader } from 'three/addons/loaders/STLLoader.js'
 const viewerHost = ref(null)
 const status = ref(null)
 const episodes = ref([])
+const episodeTasks = ref([])       // 可切换的任务目录：7012 手动拍摄目录 + 回放服务每次运行
+const taskSwitchBusy = ref(false)
+const ARM_LABEL = { left: '左臂', right: '右臂' }
 const samples = ref([])
 const markerColors = ref([])
 const selectedEpisode = ref('')
@@ -1915,6 +1918,58 @@ async function loadWorkspace() {
   }
 }
 
+async function loadEpisodeTasks() {
+  if (!status.value?.offline?.task_selectable) return
+  try {
+    const response = await fetch('/api/offline/tasks')
+    if (!response.ok) throw await responseError(response, '任务目录列表加载失败')
+    const data = await response.json()
+    episodeTasks.value = data.tasks || []
+  } catch (error) {
+    setError(error)
+  }
+}
+
+function taskLabel(task) {
+  const arm = task.arm ? ARM_LABEL[task.arm] || task.arm : '手臂未知'
+  const parent = task.path.split('/').slice(-2, -1)[0] || ''
+  const shown = ['left', 'right'].includes(parent) ? task.name : `${parent}/${task.name}`
+  const when = new Date(task.mtime * 1000).toLocaleString('zh-CN', {
+    hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+  })
+  return `${arm} · ${shown} · ${task.episode_count} 组 · ${when}`
+}
+
+async function switchEpisodeTask(path) {
+  if (!path || taskSwitchBusy.value || cloudBusy.value) return
+  if (path === status.value?.offline?.task_dir) return
+  taskSwitchBusy.value = true
+  errorMsg.value = ''
+  try {
+    const response = await fetch('/api/offline/task', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path }),
+    })
+    if (!response.ok) throw await responseError(response, '切换任务目录失败')
+    // 手臂、样本目录都随任务切换：整个工作区重新加载
+    selectedEpisode.value = ''
+    await loadWorkspace()
+    await loadEpisodeTasks()
+    if (selectedEpisode.value) {
+      await nextTick()
+      await loadPointCloud()
+      refreshHandPointMarkers()
+      updateOverlay()
+    }
+    infoMsg.value = `已切换到 ${status.value?.offline?.task_dir}（${ARM_LABEL[status.value?.arm] || status.value?.arm}）`
+  } catch (error) {
+    setError(error)
+  } finally {
+    taskSwitchBusy.value = false
+  }
+}
+
 async function selectEpisode(name) {
   if (name === selectedEpisode.value || cloudBusy.value) return
   selectedEpisode.value = name
@@ -2033,6 +2088,7 @@ onMounted(async () => {
     if (mode.value === 'mount') refreshHandHold()
   }, 5000)
   await loadWorkspace()
+  await loadEpisodeTasks()
   if (selectedEpisode.value) await loadPointCloud()
 })
 
@@ -2081,6 +2137,9 @@ onBeforeUnmount(() => {
             ? (status.mode === 'live' ? '实时采集 + episode 读取已连接' : '纯离线后端已连接')
             : '等待 episode 后端'
         }}
+        <span v-if="status?.arm" class="arm-badge" :class="status.arm">
+          {{ ARM_LABEL[status.arm] || status.arm }}
+        </span>
         <a :href="imageFrontendUrl">打开 7012 图像版</a>
       </div>
     </header>
@@ -2092,9 +2151,28 @@ onBeforeUnmount(() => {
             <h2>采集姿态</h2>
             <span>{{ episodes.length }} episodes</span>
           </div>
-          <button class="icon-button" title="刷新" @click="loadWorkspace">↻</button>
+          <button class="icon-button" title="刷新" @click="loadWorkspace(); loadEpisodeTasks()">↻</button>
         </div>
-        <div class="episode-list">
+        <label v-if="status?.offline?.task_selectable" class="task-picker" title="选择要解算的那次采集：7012 手动拍摄目录或回放服务的每次运行。手臂按目录内 episode 自动判断，样本/结果目录随之切换">
+          <span>任务目录（选哪次采集）</span>
+          <select
+            :value="status?.offline?.task_dir || ''"
+            :disabled="taskSwitchBusy || cloudBusy"
+            @change="switchEpisodeTask($event.target.value)"
+          >
+            <option
+              v-if="!episodeTasks.some((task) => task.path === status?.offline?.task_dir)"
+              :value="status?.offline?.task_dir || ''"
+            >
+              {{ status?.offline?.task_dir || '（未选择）' }}
+            </option>
+            <option v-for="task in episodeTasks" :key="task.path" :value="task.path" :disabled="!!task.error">
+              {{ task.error ? `⚠ ${task.name}：左右臂混杂` : taskLabel(task) }}
+            </option>
+          </select>
+          <small>{{ taskSwitchBusy ? '切换中…' : (status?.offline?.task_dir || '') }}</small>
+        </label>
+        <div class="episode-list" :class="{ 'with-picker': status?.offline?.task_selectable }">
           <button
             v-for="episode in episodes"
             :key="episode.name"
