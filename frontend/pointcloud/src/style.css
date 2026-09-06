@@ -1461,3 +1461,12 @@ button:disabled {
     grid-template-columns: 180px minmax(560px, 1fr) 330px;
   }
 }
+
+.mount-slot.cloud-only {
+  border-color: #b7791f;
+}
+
+.mount-slot.cloud-only small,
+.mount-slot small.missing-model {
+  color: #f6ad55;
+}

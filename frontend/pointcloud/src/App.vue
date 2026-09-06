@@ -156,11 +156,22 @@ const canSaveMountProfile = computed(() =>
   && Boolean(mountProfileName.value.trim())
   && !mountProfileBusy.value,
 )
-const mountPairedIds = computed(() =>
+// 模型点与实体点是两个独立测量，只在保存时配对：
+//   cloudPicked = 已在点云上选了实体点；paired = 模型点 + 实体点都有（可保存）；
+//   cloudOnly  = 只有实体点、还缺模型点（保存会跳过，列表里提示）
+const mountCloudPickedIds = computed(() =>
   new Set(mountDrafts.value.filter((item) => item.vertexIndex != null).map((item) => item.point_id)),
 )
 const mountPairedDrafts = computed(() =>
-  mountDrafts.value.filter((item) => item.vertexIndex != null),
+  mountDrafts.value.filter((item) => item.vertexIndex != null && Array.isArray(item.p_hand)),
+)
+const mountPairedIds = computed(() => new Set(mountPairedDrafts.value.map((item) => item.point_id)))
+const mountCloudOnlyIds = computed(() =>
+  new Set(
+    mountDrafts.value
+      .filter((item) => item.vertexIndex != null && !Array.isArray(item.p_hand))
+      .map((item) => item.point_id),
+  ),
 )
 const mountCandidateCounts = computed(() => ({
   red: mountCandidates.value.filter((item) => item.color === 'red').length,
@@ -192,7 +203,7 @@ const canSave = computed(() =>
   && Boolean(selectedEpisode.value),
 )
 const canSaveMount = computed(() =>
-  mountDrafts.value.some((item) => item.vertexIndex != null)
+  mountPairedDrafts.value.length > 0
   && !cloudBusy.value
   && !mountSaveBusy.value
   && Boolean(selectedEpisode.value)
@@ -599,10 +610,10 @@ function onPointerDown(event) {
 function onPointerUp(event) {
   if (!pointerStart || !cloudObject) return
   if (mode.value === 'marker' && !activeColor.value) return
-  if (mode.value === 'mount' && !activeMountDraft.value?.p_hand) {
+  if (mode.value === 'mount' && !activeMountSlot.value) {
     const moved = Math.hypot(event.clientX - pointerStart.x, event.clientY - pointerStart.y)
     pointerStart = null
-    if (moved <= 5) infoMsg.value = '请先选择槽位，再切到中央零位手模型选择模型点'
+    if (moved <= 5) infoMsg.value = '请先在右侧选择一个槽位（红 1–8 / 绿 1–8），再点击点云'
     return
   }
   const moved = Math.hypot(event.clientX - pointerStart.x, event.clientY - pointerStart.y)
@@ -667,7 +678,8 @@ function onPointerUp(event) {
     .toArray()
 
   if (mode.value === 'mount') {
-    const draft = activeMountDraft.value
+    // 槽位还没有模型点也可以先选实体点：以槽位信息新建草稿，模型点稍后在零位手模型上补
+    const draft = activeMountDraft.value || { ...activeMountSlot.value }
     const duplicateDraft = mountDrafts.value.find(
       (item) => item.point_id !== draft.point_id && item.vertexIndex === hit.index,
     )
@@ -690,13 +702,13 @@ function onPointerUp(event) {
       },
     ]
     lastMountSelectedPointId.value = draft.point_id
-    infoMsg.value = `${draft.label} 已完成配对（距点击 ${screenDistancePx.toFixed(1)} px）`
     refreshHighlights()
     refreshHandPointMarkers()
     const next = chooseNextMountCloudSlot(draft.point_id)
+    const modelHint = draft.p_hand ? '' : '（该槽位还缺模型点，保存前请到「零位手模型」补上）'
     infoMsg.value = next
-      ? `${draft.label} 已选中，可立即保存；也可继续选 ${next.label}`
-      : `${draft.label} 已选中，可立即保存当前 episode`
+      ? `${draft.label} 实体点已选${modelHint}；可继续选 ${next.label}`
+      : `${draft.label} 实体点已选${modelHint}`
     return
   }
 
@@ -1016,7 +1028,7 @@ function chooseNextMountCloudSlot(currentPointId = '') {
   const next = nextMountSlotAfter(
     currentPointId,
     (slot) =>
-      !mountPairedIds.value.has(slot.point_id) && !mountSavedIds.value.has(slot.point_id),
+      !mountCloudPickedIds.value.has(slot.point_id) && !mountSavedIds.value.has(slot.point_id),
   )
   if (next) {
     activeMountSlotId.value = next.point_id
@@ -1176,11 +1188,6 @@ async function useMountCandidatesInCloud() {
 }
 
 async function beginMountCloudPairing() {
-  if (!allMountModelPointsSelected.value) {
-    mountViewport.value = 'model'
-    infoMsg.value = `请先标完 16 个模型点，当前已完成 ${mountDraftIds.value.size} 个`
-    return
-  }
   if (!selectedEpisode.value || !cloudId.value) {
     infoMsg.value = '请先选择并加载一个 episode 点云'
     return
@@ -1426,9 +1433,6 @@ function activateMountSlot(pointId) {
     infoMsg.value = draft?.p_hand
       ? `${draft.label} 模型点已选；再次点击 mesh 可修正`
       : `请在零位手模型上标注 ${mountSlotInfo(pointId).label}`
-  } else if (!draft?.p_hand) {
-    mountViewport.value = 'model'
-    infoMsg.value = `${mountSlotInfo(pointId).label} 尚未标注模型点`
   } else if (cloudPoint) {
     mountViewport.value = 'cloud'
     lastMountSelectedPointId.value = pointId
@@ -1440,7 +1444,10 @@ function activateMountSlot(pointId) {
       focusMountCloudPoint(cloudPoint)
     })
   } else {
-    infoMsg.value = `请在当前 episode 点云选择 ${draft.label}`
+    const label = mountSlotInfo(pointId).label
+    infoMsg.value = draft?.p_hand
+      ? `请在当前 episode 点云选择 ${label}`
+      : `请在当前 episode 点云选择 ${label}（模型点可稍后在「零位手模型」补）`
   }
   refreshHighlights()
   refreshHandPointMarkers()
@@ -1495,7 +1502,7 @@ function onHandPointerUp(event) {
   const next = chooseNextMountModelSlot(slot.point_id)
   infoMsg.value = next
     ? `${slot.label} 模型点已选；下一项：${next.label}`
-    : '16 个模型点已全部标注，请点击“下一步：查看当前 episode RGB 原图”'
+    : '16 个模型点已全部标注；实体点随时可在「实体点云」里选'
   refreshHighlights()
   refreshHandPointMarkers()
 }
@@ -2222,7 +2229,7 @@ onBeforeUnmount(() => {
             </button>
             <button
               :class="{ active: mountViewport === 'rgb' }"
-              :disabled="!allMountModelPointsSelected || !selectedEpisode"
+              :disabled="!selectedEpisode"
               title="查看原始RGB和圆圈识别结果"
               @click="beginMountCloudPairing"
             >
@@ -2230,8 +2237,8 @@ onBeforeUnmount(() => {
             </button>
             <button
               :class="{ active: mountViewport === 'cloud' }"
-              :disabled="!allMountModelPointsSelected"
-              title="查看当前 episode 的实体点云"
+              :disabled="!selectedEpisode"
+              title="查看当前 episode 的实体点云（模型点与实体点可任意先后标注，保存时配对）"
               @click="mountViewport = 'cloud'"
             >
               实体点云
@@ -2479,9 +2486,9 @@ onBeforeUnmount(() => {
           <section class="side-card mount-slots-card">
             <div class="panel-heading compact">
               <div>
-                <h2>3. 先标注手模型的 16 个点</h2>
+                <h2>3. 手模型上的 16 个模型点</h2>
                 <span>
-                  已完成 {{ mountDraftIds.size }}/16 · 全部完成后再进入点云
+                  已完成 {{ mountDraftIds.size }}/16 · 与实体点无先后顺序，保存时按槽位配对
                 </span>
               </div>
             </div>
@@ -2499,6 +2506,7 @@ onBeforeUnmount(() => {
                       active: activeMountSlotId === slot.point_id,
                       modeled: mountDraftIds.has(slot.point_id),
                       paired: mountPairedIds.has(slot.point_id),
+                      'cloud-only': mountCloudOnlyIds.has(slot.point_id),
                       saved: mountSavedIds.has(slot.point_id),
                     }"
                     :title="`${slot.label}（${slot.point_id}）`"
@@ -2507,6 +2515,7 @@ onBeforeUnmount(() => {
                     <i :style="{ background: slot.color }"></i>
                     <span>{{ slot.shortLabel }}</span>
                     <small v-if="mountPairedIds.has(slot.point_id)">待保存</small>
+                    <small v-else-if="mountCloudOnlyIds.has(slot.point_id)" class="missing-model">缺模型点</small>
                     <small v-else-if="mountSavedIds.has(slot.point_id)">已保存</small>
                     <small v-else-if="mountDraftIds.has(slot.point_id)">
                       {{ mountViewport === 'cloud' ? '点云待选' : (mountViewport === 'rgb' ? 'RGB复核' : '模型已选') }}
@@ -2514,7 +2523,7 @@ onBeforeUnmount(() => {
                     <small v-else>模型待选</small>
                   </button>
                   <button
-                    v-if="mountPairedIds.has(slot.point_id) || mountSavedIds.has(slot.point_id)"
+                    v-if="mountCloudPickedIds.has(slot.point_id) || mountSavedIds.has(slot.point_id)"
                     class="mount-slot-clear"
                     :title="`删除 ${slot.shortLabel} 的实体点`"
                     @click.stop="clearMountSlotCloudPoint(slot.point_id)"
@@ -2538,6 +2547,7 @@ onBeforeUnmount(() => {
                       active: activeMountSlotId === slot.point_id,
                       modeled: mountDraftIds.has(slot.point_id),
                       paired: mountPairedIds.has(slot.point_id),
+                      'cloud-only': mountCloudOnlyIds.has(slot.point_id),
                       saved: mountSavedIds.has(slot.point_id),
                     }"
                     :title="`${slot.label}（${slot.point_id}）`"
@@ -2546,6 +2556,7 @@ onBeforeUnmount(() => {
                     <i :style="{ background: slot.color }"></i>
                     <span>{{ slot.shortLabel }}</span>
                     <small v-if="mountPairedIds.has(slot.point_id)">待保存</small>
+                    <small v-else-if="mountCloudOnlyIds.has(slot.point_id)" class="missing-model">缺模型点</small>
                     <small v-else-if="mountSavedIds.has(slot.point_id)">已保存</small>
                     <small v-else-if="mountDraftIds.has(slot.point_id)">
                       {{ mountViewport === 'cloud' ? '点云待选' : (mountViewport === 'rgb' ? 'RGB复核' : '模型已选') }}
@@ -2553,7 +2564,7 @@ onBeforeUnmount(() => {
                     <small v-else>模型待选</small>
                   </button>
                   <button
-                    v-if="mountPairedIds.has(slot.point_id) || mountSavedIds.has(slot.point_id)"
+                    v-if="mountCloudPickedIds.has(slot.point_id) || mountSavedIds.has(slot.point_id)"
                     class="mount-slot-clear"
                     :title="`删除 ${slot.shortLabel} 的实体点`"
                     @click.stop="clearMountSlotCloudPoint(slot.point_id)"
@@ -2576,10 +2587,10 @@ onBeforeUnmount(() => {
             <div class="mount-stage-actions">
               <button
                 class="primary-button"
-                :disabled="!allMountModelPointsSelected"
+                :disabled="!selectedEpisode"
                 @click="beginMountCloudPairing"
               >
-                下一步：查看当前 episode RGB 原图
+                查看当前 episode RGB 原图
               </button>
               <button
                 class="text-button"
@@ -2597,11 +2608,12 @@ onBeforeUnmount(() => {
                 <h2>4. 当前 episode 实体点</h2>
                 <span>
                   {{ mountPairedIds.size }} 对待保存 · {{ mountSavedForEpisode.length }} 对已保存
+                  <template v-if="mountCloudOnlyIds.size"> · {{ mountCloudOnlyIds.size }} 个实体点缺模型点</template>
                 </span>
               </div>
               <button
                 class="text-button"
-                :disabled="!mountPairedDrafts.length"
+                :disabled="!mountCloudPickedIds.size"
                 @click="clearMountCloudSelections"
               >
                 清空待保存点
@@ -2615,12 +2627,13 @@ onBeforeUnmount(() => {
               }}
             </button>
             <p class="mount-save-hint">
-              选中 1 个即可保存；无需在当前 episode 看齐 16 个点。
+              选中 1 对即可保存；无需在当前 episode 看齐 16 个点。
+              <template v-if="mountCloudOnlyIds.size">只有实体点、还缺模型点的槽位不会被保存，请到「零位手模型」补上。</template>
             </p>
             <div class="mount-candidate-tools">
               <button
                 class="secondary-button"
-                :disabled="!allMountModelPointsSelected || !cloudId || mountCandidateBusy"
+                :disabled="!cloudId || mountCandidateBusy"
                 @click="reviewMountRgb"
               >
                 {{ mountCandidateBusy ? 'RGB识别中…' : '打开RGB原图并重新识别' }}
