@@ -127,6 +127,19 @@ cd frontend && npm run dev:mount-diagnostics  # http://<IP>:7015 安装标定诊
 
 可用 `--record-task-dir /path/to/task` 修改两者共用的数据目录。
 
+### 离线解算（推荐：`--offline`，手臂自动）
+
+```bash
+./start.sh --offline
+```
+
+不开相机、不连机器人。启动时自动选最近一次 episode 任务目录，网页 7013 顶部
+「任务目录」下拉框列出所有可选任务（`teleop_data/biaoding/<arm>/` 手动拍摄目录 +
+`../calibration_replay_data/runs/<arm>/<run>/` 回放服务的每次运行），选一项即切换。
+**手臂由 episode 自身的 `info.arm` 决定**，不需要也不应该手填：切换任务时后端同步切换
+上报的手臂、FK 链和样本/结果目录 `handeye3d_data/biaoding/<arm>/`。一个任务目录内
+左右臂混杂会被拒绝。对应接口：`GET /api/offline/tasks`、`POST /api/offline/task {path}`。
+
 ### 纯离线导入已有 episode（兼容入口）
 
 本项目可以直接读取 eai-teleop-studio 的手眼标定任务目录：
@@ -143,6 +156,7 @@ cd frontend && npm run dev:mount-diagnostics  # http://<IP>:7015 安装标定诊
   --no-timestamp-dir
 ```
 
+指定 `--teleop-task-dir` 时 `--arm` 只是无数据时的默认值，目录内 episode 记录的手臂优先。
 兼容脚本默认读取 `teleop_data/biaoding/<arm>`（`CALIB_ARM=left|right`，默认 right），使用
 `config/camera/orbbec_rgbd_calibration.json`，并固定写入
 `handeye3d_data/biaoding/<arm>`。也可通过环境变量覆盖：

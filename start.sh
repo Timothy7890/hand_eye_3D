@@ -4,7 +4,8 @@
 #   ./start.sh              # 默认：7012 采集、7013 选点、7015 查看安装标定诊断
 #   ./start.sh --no-arm     # 不启用手臂控制（只读 rt/lowstate，绝不发布，可与其他控制程序并存）
 #   ./start.sh --arm left   # 采集/求解左臂（默认 right）；数据落 .../biaoding/<left|right>/
-#   ./start.sh --teleop-task-dir /path/to/task  # 兼容的纯离线处理模式
+#   ./start.sh --offline                        # 离线解算：自动选最近一次 episode 任务，网页里可切换
+#   ./start.sh --teleop-task-dir /path/to/task  # 离线解算指定目录（手臂按 episode 自动判断）
 #   ./start.sh <其他参数>    # 其余参数原样传给 run_server.py（如 --arm-grav-in-float）
 #
 # Ctrl+C 退出：后端会先把手臂权重渐出、交还本体控制器（此时请扶住手臂），再退出。
@@ -80,7 +81,7 @@ for a in "$@"; do
   else
     EXTRA+=("$a")
     case "$a" in
-      --teleop-task-dir|--teleop-task-dir=*) OFFLINE=1 ;;
+      --teleop-task-dir|--teleop-task-dir=*|--offline) OFFLINE=1 ;;
       --save-path|--save-path=*) SAVE_PATH_GIVEN=1 ;;
       --record-task-dir|--record-task-dir=*) RECORD_DIR_GIVEN=1 ;;
       --arm) EXPECT_ARM=1 ;;
@@ -99,7 +100,8 @@ case " ${EXTRA[*]} " in
 esac
 if [ "$OFFLINE" -eq 1 ]; then
   ARM_ARGS=()
-  echo "离线遥操作数据模式：不打开相机、不连接或控制机器人。"
+  echo "离线解算模式：不打开相机、不连接或控制机器人。"
+  echo "手臂由 episode 自身记录决定（--arm 仅作无数据时的默认）；任务目录可在 7013 网页顶部切换。"
 else
   echo "统一实时模式：7012 连接相机并采集；7013 读取同一目录中已落盘的 episode。"
   echo "在 7012 按 C 完成采集后，到 7013 点击刷新即可加载。"

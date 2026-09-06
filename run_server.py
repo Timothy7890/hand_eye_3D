@@ -62,6 +62,12 @@ def main() -> int:
                         help="启动等待首个合法 RGB-D 帧的秒数")
     parser.add_argument("--teleop-task-dir", default=None,
                         help="离线 robot-style 任务目录；设置后不占用 Orbbec 相机")
+    parser.add_argument("--offline", action="store_true",
+                        help="离线解算模式但不指定目录：自动选最近一次 episode 任务，"
+                             "网页里可再切换（手臂由 episode 自身决定）")
+    parser.add_argument("--replay-runs-root", default=None,
+                        help="回放服务每次运行的根目录（默认 ../calibration_replay_data/runs），"
+                             "网页任务列表会枚举其中的 runs/<arm>/<run>/")
     parser.add_argument(
         "--record-task-dir",
         default=str(PROJECT_ROOT / "teleop_data" / "biaoding"),
@@ -134,10 +140,39 @@ def main() -> int:
     if not args.no_timestamp_dir:
         session_dir = session_dir / datetime.now().strftime("%Y%m%d_%H%M%S")
 
+    from backend.offline import infer_task_arm, list_episode_tasks
+
+    # 按臂分层：--save-path 指到 .../biaoding/<arm> 时，父目录即 save_root，切臂时自动换子目录
+    save_root = session_dir.parent if session_dir.name in ("left", "right") else None
+    replay_runs_root = Path(
+        args.replay_runs_root or (PROJECT_ROOT.parent / "calibration_replay_data" / "runs")
+    ).expanduser().resolve()
+    record_root = Path(args.record_task_dir).expanduser().resolve()
+    record_root = record_root.parent if record_root.name in ("left", "right") else record_root
+    episode_task_roots = [record_root, replay_runs_root]
+
     offline_backend = None
     episode_backend = None
     live_record_task_dir = None
+    if args.offline and not args.teleop_task_dir:
+        tasks = list_episode_tasks(episode_task_roots)
+        if not tasks:
+            print(f"[handeye3d] --offline 但 {episode_task_roots} 下没有任何 episode 任务目录")
+            return 1
+        args.teleop_task_dir = tasks[0]["path"]
+        print(f"[handeye3d] --offline 自动选择最近的任务: {args.teleop_task_dir}")
     if args.teleop_task_dir:
+        # 离线解算：手臂以 episode 自身记录为准，避免 --arm 与数据不一致
+        try:
+            inferred_arm = infer_task_arm(args.teleop_task_dir)
+        except ValueError as exc:
+            print(f"[handeye3d] {exc}")
+            return 1
+        if inferred_arm and inferred_arm != args.arm:
+            print(f"[handeye3d] episode 记录的是 {inferred_arm} 臂，覆盖 --arm {args.arm}")
+            args.arm = inferred_arm
+        if save_root is not None:
+            session_dir = save_root / args.arm
         offline_backend = OfflineEpisodeBackend(
             args.teleop_task_dir, args.rgbd_calib, arm=args.arm
         )
@@ -205,6 +240,8 @@ def main() -> int:
     app_module.arm_side = args.arm
     app_module.arm_factory = arm_factory
     app_module.save_path = session_dir
+    app_module.save_root = save_root
+    app_module.episode_task_roots = episode_task_roots
     app_module.offline_backend = offline_backend
     app_module.episode_backend = episode_backend
     app_module.teleop_task_dir = (

@@ -139,16 +139,9 @@ class H2PoseProvider(PoseProvider):
 
         cfg = load_robot_config(H2_ROBOT_CONFIG_PATH)
         self._model = RobotModel(cfg)
-        self._chain = f"{arm}_arm"
-        if self._chain not in self._model.chain_ids:
-            raise ValueError(f"h2.yaml 中没有链 {self._chain!r}（可选: {self._model.chain_ids}）")
-        self._joint_names = self._model.joint_names(self._chain)
-        self._motor_indices = (H2_RIGHT_ARM_MOTOR_INDICES if arm == "right"
-                               else H2_LEFT_ARM_MOTOR_INDICES)
-        self.base_link = base_link or self._model.base_link(self._chain)
-        self.wrist_link = self._model.end_link(self._chain)
-
+        self._base_link_override = base_link
         self._q_reader = q_reader
+        self._bind_arm(arm)
         self._lock = threading.Lock()
         self._low_state = None
         if q_reader is None:
@@ -163,6 +156,29 @@ class H2PoseProvider(PoseProvider):
                     raise TimeoutError(
                         f"{lowstate_timeout:.0f}s 内没收到 rt/lowstate（网卡对吗？机器人开机了吗？）")
                 time.sleep(0.05)
+
+    def _bind_arm(self, arm: str) -> None:
+        chain = f"{arm}_arm"
+        if chain not in self._model.chain_ids:
+            raise ValueError(f"h2.yaml 中没有链 {chain!r}（可选: {self._model.chain_ids}）")
+        self.arm = arm
+        self._chain = chain
+        self._joint_names = self._model.joint_names(chain)
+        self._motor_indices = (H2_RIGHT_ARM_MOTOR_INDICES if arm == "right"
+                               else H2_LEFT_ARM_MOTOR_INDICES)
+        self.base_link = self._base_link_override or self._model.base_link(chain)
+        self.wrist_link = self._model.end_link(chain)
+
+    def set_arm(self, arm: str) -> None:
+        """切换读取哪条臂（同一 rt/lowstate 订阅，只换电机序号与 FK 链）。
+
+        共用手臂控制器订阅（q_reader）时不能切换：控制器绑定了固定手臂。
+        """
+        if arm == self.arm:
+            return
+        if self._q_reader is not None:
+            raise RuntimeError("手臂已接管，接管期间不能切换位姿读取的手臂；请先释放控制")
+        self._bind_arm(arm)
 
     def _on_low_state(self, msg) -> None:
         with self._lock:

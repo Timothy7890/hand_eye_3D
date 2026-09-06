@@ -737,3 +737,96 @@ class LiveEpisodeRecorderTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EpisodeTaskSwitchTest(unittest.TestCase):
+    """网页切换任务目录：手臂按 episode 自动判断，样本目录随臂切换。"""
+
+    def setUp(self):
+        self.patches = [
+            patch("backend.offline.RobotModel", _FakeRobotModel),
+            patch("backend.offline.load_robot_config", return_value={}),
+        ]
+        for item in self.patches:
+            item.start()
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.root = Path(self.tempdir.name)
+        self.calibration_path = self.root / "rgbd.json"
+        _write_calibration(self.calibration_path)
+        self.runs = self.root / "runs"
+        _write_episode(self.runs / "right" / "run-a", "episode_0000", [1000] * 5, arm="right")
+        _write_episode(self.runs / "left" / "run-b", "episode_0000", [1000] * 5, arm="left")
+        _write_episode(self.runs / "left" / "run-b", "episode_0001", [1000] * 5, arm="left")
+        _write_episode(self.runs / "left" / "mixed", "episode_0000", [1000] * 5, arm="left")
+        _write_episode(self.runs / "left" / "mixed", "episode_0001", [1000] * 5, arm="right")
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+        for item in self.patches:
+            item.stop()
+
+    def test_infer_and_list(self):
+        from backend.offline import infer_task_arm, list_episode_tasks
+
+        self.assertEqual(infer_task_arm(self.runs / "left" / "run-b"), "left")
+        self.assertIsNone(infer_task_arm(self.root))
+        with self.assertRaises(ValueError):
+            infer_task_arm(self.runs / "left" / "mixed")
+        tasks = {item["name"]: item for item in list_episode_tasks([self.runs])}
+        self.assertEqual(set(tasks), {"run-a", "run-b", "mixed"})
+        self.assertEqual(tasks["run-b"]["arm"], "left")
+        self.assertEqual(tasks["run-b"]["episode_count"], 2)
+        self.assertIsNone(tasks["mixed"]["arm"])
+        self.assertIn("两条臂", tasks["mixed"]["error"])
+
+    def test_switch_task_follows_episode_arm(self):
+        from backend import app as app_module
+
+        class _PoseProvider:
+            arm = "right"
+
+            def set_arm(self, arm):
+                self.arm = arm
+
+        saved = {
+            name: getattr(app_module, name)
+            for name in (
+                "save_path", "save_root", "offline_backend", "episode_backend",
+                "teleop_task_dir", "arm_side", "pose_provider", "rgbd_calib_path",
+                "episode_task_roots", "arm_controller",
+            )
+        }
+        try:
+            app_module.save_root = self.root / "biaoding"
+            app_module.save_path = app_module.save_root / "right"
+            app_module.offline_backend = None
+            app_module.episode_backend = None
+            app_module.teleop_task_dir = None
+            app_module.arm_side = "right"
+            app_module.arm_controller = None
+            app_module.pose_provider = _PoseProvider()
+            app_module.rgbd_calib_path = self.calibration_path
+            app_module.episode_task_roots = [self.runs]
+
+            info = app_module.switch_episode_task(self.runs / "left" / "run-b")
+            self.assertEqual(info["arm"], "left")
+            self.assertEqual(app_module._active_arm(), "left")
+            self.assertEqual(app_module.pose_provider.arm, "left")
+            self.assertEqual(app_module.save_path, app_module.save_root / "left")
+            self.assertTrue((app_module.save_root / "left" / "samples").is_dir())
+            self.assertEqual(
+                app_module._available_episode_backend().task_dir,
+                (self.runs / "left" / "run-b").resolve(),
+            )
+
+            with self.assertRaises(ValueError):
+                app_module.switch_episode_task(self.runs / "left" / "mixed")
+            with self.assertRaises(PermissionError):
+                app_module.switch_episode_task(self.root)
+            app_module.arm_controller = object()
+            with self.assertRaises(RuntimeError):
+                app_module.switch_episode_task(self.runs / "right" / "run-a")
+        finally:
+            for name, value in saved.items():
+                setattr(app_module, name, value)
+

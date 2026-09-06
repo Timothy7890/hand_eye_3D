@@ -34,6 +34,8 @@ from .offline import (
     OfflineEpisodeBackend,
     PointCloudStaleError,
     RIGHT_ARM_DATASET_JOINTS,
+    infer_task_arm,
+    list_episode_tasks,
 )
 from .markers import CANONICAL_COLORS, canonical_color, marker_catalog_public
 from .paths import PROJECT_ROOT
@@ -66,6 +68,8 @@ save_path: Path = Path("./handeye3d_data")
 offline_backend: OfflineEpisodeBackend | None = None
 episode_backend: OfflineEpisodeBackend | None = None
 teleop_task_dir: Path | None = None
+save_root: Path | None = None            # <...>/biaoding：按臂分层的父目录；切换任务时 save_path = save_root/<arm>
+episode_task_roots: list[Path] = []      # 前端可选的任务目录根：teleop_data/biaoding、calibration_replay_data/runs
 record_task_dir: Path | None = None
 rgbd_calib_path: Path = DEFAULT_RGBD_CALIB_PATH
 mount_calib_path: Path | None = None
@@ -325,6 +329,8 @@ async def api_status():
             ),
             "rgbd_calib": str(rgbd_calib_path),
             "serial_mismatch_policy": "warning",
+            "arm": _active_arm(),
+            "task_selectable": bool(episode_task_roots),
         },
     }
 
@@ -821,6 +827,84 @@ async def api_pick(body: dict):
     result = await asyncio.to_thread(camera.pick, u, v)
     status = 200 if result.get("ok") else 502
     return JSONResponse(result, status_code=status)
+
+
+def _task_dir_allowed(path: Path) -> bool:
+    for root in episode_task_roots:
+        try:
+            path.relative_to(Path(root).expanduser().resolve())
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def switch_episode_task(path: str | Path) -> dict:
+    """切换要浏览/解算的 episode 任务目录；手臂由 episode 自身的 info.arm 决定。
+
+    随之切换：episode 读取器、上报的手臂、位姿源的 FK 链（未接管时）、以及
+    样本/结果目录 save_root/<arm>（只有 save_root 已知时才移动）。
+    """
+    global offline_backend, episode_backend, teleop_task_dir, arm_side, save_path
+
+    target = Path(path).expanduser().resolve()
+    if not target.is_dir():
+        raise FileNotFoundError(f"任务目录不存在: {target}")
+    if not _task_dir_allowed(target):
+        raise PermissionError(f"任务目录不在允许的根目录内: {target}")
+    if arm_controller is not None:
+        raise RuntimeError("手臂已接管，释放控制后再切换任务目录")
+    arm = infer_task_arm(target)
+    if arm is None:
+        raise ValueError(f"{target} 里没有可读的 hand_eye_calibration episode，无法判断手臂")
+    backend = OfflineEpisodeBackend(target, rgbd_calib_path, arm=arm)
+    setter = getattr(pose_provider, "set_arm", None)
+    if offline_backend is None and callable(setter):
+        setter(arm)
+    if offline_backend is not None:
+        offline_backend = backend
+        teleop_task_dir = backend.task_dir
+    else:
+        episode_backend = backend
+    arm_side = arm
+    if save_root is not None:
+        save_path = save_root / arm
+    init_state()
+    return {"task_dir": str(backend.task_dir), "arm": arm, "save_path": str(save_path)}
+
+
+@app.get("/api/offline/tasks")
+async def api_offline_tasks():
+    """列出可切换的 episode 任务目录（手动拍摄目录 + 回放服务的每次运行）。"""
+    browsing = _available_episode_backend()
+    current = str(browsing.task_dir) if browsing is not None else None
+    tasks = await asyncio.to_thread(list_episode_tasks, list(episode_task_roots))
+    for item in tasks:
+        item["current"] = item["path"] == current
+    return {
+        "ok": True,
+        "tasks": tasks,
+        "current": current,
+        "roots": [str(root) for root in episode_task_roots],
+    }
+
+
+@app.post("/api/offline/task")
+async def api_offline_switch_task(body: dict):
+    path = body.get("path") if isinstance(body, dict) else None
+    if not isinstance(path, str) or not path.strip():
+        return JSONResponse({"ok": False, "error": "path 必须是非空字符串"}, status_code=400)
+    try:
+        result = await asyncio.to_thread(switch_episode_task, path.strip())
+    except FileNotFoundError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=404)
+    except PermissionError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=403)
+    except (ValueError, EpisodeValidationError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=422)
+    except RuntimeError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
+    return {"ok": True, **result}
 
 
 @app.get("/api/offline/episodes")

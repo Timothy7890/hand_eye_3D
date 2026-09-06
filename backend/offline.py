@@ -43,6 +43,84 @@ class EpisodeValidationError(ValueError):
     """遥操作 episode 内容不完整或与生产配置不兼容。"""
 
 
+def _episode_arm(info: dict, rows: Any) -> str | None:
+    """episode 属于哪条臂：优先 info.arm，其次 arm_state_key / <arm>_arm_joint_order / states 键。"""
+    arm = info.get("arm")
+    if arm in ARM_DATASET_JOINTS:
+        return str(arm)
+    candidates: set[str] = set()
+    for key in ARM_DATASET_JOINTS:
+        if info.get("arm_state_key") == f"{key}_arm" or f"{key}_arm_joint_order" in info:
+            candidates.add(key)
+    if not candidates and isinstance(rows, list) and rows:
+        states = rows[0].get("states") if isinstance(rows[0], dict) else None
+        if isinstance(states, dict):
+            candidates = {key for key in ARM_DATASET_JOINTS if f"{key}_arm" in states}
+    return next(iter(candidates)) if len(candidates) == 1 else None
+
+
+def infer_task_arm(task_dir: str | Path) -> str | None:
+    """从目录内 hand_eye_calibration episode 的 info.arm 推断手臂。
+
+    没有可读 episode 返回 None；左右混杂抛 ValueError（一个任务目录只能属于一条臂）。
+    """
+    arms: set[str] = set()
+    for data_path in sorted(Path(task_dir).glob("episode_*/data.json")):
+        try:
+            payload = json.loads(data_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        info = payload.get("info") if isinstance(payload, dict) else None
+        if not isinstance(info, dict) or info.get("kind") != "hand_eye_calibration":
+            continue
+        arm = _episode_arm(info, payload.get("data"))
+        if arm is not None:
+            arms.add(arm)
+    if len(arms) > 1:
+        raise ValueError(
+            f"{task_dir} 同时包含 {sorted(arms)} 两条臂的 episode，一个任务目录只能属于一条臂"
+        )
+    return next(iter(arms)) if arms else None
+
+
+def list_episode_tasks(roots: list[Path], *, max_depth: int = 2) -> list[dict[str, Any]]:
+    """枚举各根目录下含 episode_*/data.json 的任务目录（最多向下 max_depth 层）。
+
+    典型布局：teleop_data/biaoding/<arm>/episode_*、calibration_replay_data/runs/<arm>/<run>/episode_*。
+    结果按最近修改时间倒序，供前端直接选择。
+    """
+    tasks: dict[Path, dict[str, Any]] = {}
+
+    def visit(directory: Path, depth: int) -> None:
+        if not directory.is_dir():
+            return
+        episodes = sorted(directory.glob("episode_*/data.json"))
+        if episodes:
+            try:
+                arm = infer_task_arm(directory)
+                error = None
+            except ValueError as exc:
+                arm, error = None, str(exc)
+            tasks[directory] = {
+                "path": str(directory),
+                "name": directory.name,
+                "arm": arm,
+                "episode_count": len(episodes),
+                "mtime": max(path.stat().st_mtime for path in episodes),
+                "error": error,
+            }
+            return
+        if depth >= max_depth:
+            return
+        for child in sorted(directory.iterdir()):
+            if child.is_dir() and not child.name.startswith("."):
+                visit(child, depth + 1)
+
+    for root in roots:
+        visit(Path(root).expanduser().resolve(), 0)
+    return sorted(tasks.values(), key=lambda item: item["mtime"], reverse=True)
+
+
 class PointCloudStaleError(EpisodeValidationError):
     """前端提交的点云已经不是当前 episode 对应的版本。"""
 

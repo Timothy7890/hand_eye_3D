@@ -20,6 +20,9 @@ const imgEl = ref(null)
 const offlineEpisodes = ref([])
 const selectedEpisode = ref('')
 const episodesBusy = ref(false)
+const episodeTasks = ref([])          // 可切换的 episode 任务目录（手动拍摄目录 + 回放服务每次运行）
+const taskSwitchBusy = ref(false)
+const ARM_LABEL = { left: '左臂', right: '右臂' }
 const previewVersion = ref(0)
 const showDepthOverlay = ref(false)
 const depthOverlayOpacity = ref(45)
@@ -221,6 +224,55 @@ async function detectMarkers(episode = selectedEpisode.value) {
 
 async function refreshStatus() {
   status.value = await (await fetch('/api/status')).json()
+}
+
+async function refreshEpisodeTasks() {
+  if (!status.value?.offline?.task_selectable) return
+  try {
+    const res = await fetch('/api/offline/tasks')
+    const data = await res.json()
+    if (!res.ok || !data.ok) throw new Error(data.error || '任务目录列表加载失败')
+    episodeTasks.value = data.tasks || []
+  } catch (e) {
+    errorMsg.value = e instanceof Error ? e.message : String(e)
+  }
+}
+
+function taskLabel(task) {
+  const arm = task.arm ? ARM_LABEL[task.arm] || task.arm : '手臂未知'
+  const parent = task.path.split('/').slice(-2, -1)[0] || ''
+  const shown = ['left', 'right'].includes(parent) ? task.name : `${parent}/${task.name}`
+  const when = new Date(task.mtime * 1000).toLocaleString('zh-CN', { hour12: false })
+  return `${arm} · ${shown} · ${task.episode_count} 组 · ${when}`
+}
+
+async function switchEpisodeTask(path) {
+  if (!path || taskSwitchBusy.value || markerBusy.value || markerConfirmBusy.value) return
+  const current = status.value?.offline?.task_dir
+  if (path === current) return
+  taskSwitchBusy.value = true
+  errorMsg.value = ''
+  try {
+    const res = await fetch('/api/offline/task', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path }),
+    })
+    const data = await res.json()
+    if (!res.ok || !data.ok) throw new Error(data.error || '切换任务目录失败')
+    // 手臂、样本目录都随任务切换，整页数据重新拉取
+    selectedEpisode.value = ''
+    result.value = null
+    await refreshStatus()
+    await refreshSamples()
+    await refreshOfflineEpisodes()
+    await refreshPivot()
+    await refreshEpisodeTasks()
+  } catch (e) {
+    errorMsg.value = e instanceof Error ? e.message : String(e)
+  } finally {
+    taskSwitchBusy.value = false
+  }
 }
 
 async function recordEpisode() {
@@ -859,6 +911,7 @@ onMounted(async () => {
   if (offlineMode.value) await loadMarkerColors()
   await refreshSamples()
   await refreshOfflineEpisodes()
+  await refreshEpisodeTasks()
   await refreshArm()
   await refreshPivot()
   setInterval(() => {
@@ -878,7 +931,10 @@ onBeforeUnmount(() => {
       眼在手外 · 联合估计指尖偏移 · 输出 T_{{ status?.base_link || 'base' }}←camera（彩色相机系）
     </span>
     <div class="spacer" />
-    <span v-if="offlineMode" class="badge good">离线遥操作剧集</span>
+    <span v-if="offlineMode" class="badge good">离线解算</span>
+    <span v-if="status?.arm" class="badge" :class="status.arm === 'left' ? 'arm-left' : 'arm-right'">
+      {{ ARM_LABEL[status.arm] || status.arm }}（按 episode 自动判断）
+    </span>
     <span v-if="offlineMode && status?.teleop_task_dir" class="badge">
       数据目录: {{ status.teleop_task_dir }}
     </span>
@@ -900,10 +956,26 @@ onBeforeUnmount(() => {
       <div v-if="offlineMode" class="card offline-panel">
         <h2>
           离线剧集（{{ offlineEpisodes.length }}）
-          <button class="btn refresh-btn" :disabled="episodesBusy" @click="refreshOfflineEpisodes">
+          <button class="btn refresh-btn" :disabled="episodesBusy" @click="refreshOfflineEpisodes(); refreshEpisodeTasks()">
             {{ episodesBusy ? '刷新中…' : '刷新' }}
           </button>
         </h2>
+        <label v-if="status?.offline?.task_selectable" class="task-picker">
+          <span>任务目录</span>
+          <select
+            :value="status?.offline?.task_dir || ''"
+            :disabled="taskSwitchBusy || markerBusy || markerConfirmBusy"
+            @change="switchEpisodeTask($event.target.value)"
+          >
+            <option v-if="!episodeTasks.some((task) => task.path === status?.offline?.task_dir)" :value="status?.offline?.task_dir || ''">
+              {{ status?.offline?.task_dir || '（未选择）' }}
+            </option>
+            <option v-for="task in episodeTasks" :key="task.path" :value="task.path" :disabled="!!task.error">
+              {{ task.error ? `⚠ ${task.name}：左右臂混杂` : taskLabel(task) }}
+            </option>
+          </select>
+          <span class="coord dim">{{ taskSwitchBusy ? '切换中…' : '切换后手臂与样本目录随之变化' }}</span>
+        </label>
         <div v-if="offlineEpisodes.length" class="episode-list">
           <button
             v-for="episode in offlineEpisodes"
@@ -1459,6 +1531,34 @@ onBeforeUnmount(() => {
 
 .refresh-btn {
   padding: 4px 10px;
+}
+
+.task-picker {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 8px;
+  align-items: center;
+  margin: 6px 0 10px;
+  font-size: 13px;
+}
+
+.task-picker select {
+  min-width: 0;
+  padding: 4px 6px;
+}
+
+.task-picker .coord {
+  grid-column: 2;
+}
+
+.badge.arm-left {
+  background: #2f5f9e;
+  color: #fff;
+}
+
+.badge.arm-right {
+  background: #9e5f2f;
+  color: #fff;
 }
 
 .episode-list {
