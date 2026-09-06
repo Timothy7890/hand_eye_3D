@@ -102,6 +102,10 @@ class _FakePoseProvider:
         self.read_count += 1
         return q
 
+    def read_motor_q(self, indices) -> list:
+        # 模拟整帧 lowstate：电机序号 15–21 为左臂、22–28 为右臂，值 = 序号/100
+        return [i / 100.0 for i in indices]
+
 
 class ReplayEpisodeRecorderTest(unittest.TestCase):
     def setUp(self):
@@ -220,6 +224,22 @@ class ReplayEpisodeRecorderTest(unittest.TestCase):
             app_module.api_record_episode({"frame_count": 3, "record_dir": "relative/dir"})
         )
         self.assertEqual(relative.status_code, 400)
+
+    def test_request_arm_overrides_service_arm(self):
+        """回放服务按计划指定 arm：服务以 right 启动，也能记录左臂关节（同一帧 lowstate 的另一组电机）。"""
+        app_module.arm_side = "right"
+        status = asyncio.run(app_module.api_status())
+        self.assertTrue(status["recording"]["arm_selectable"])
+        self.assertEqual(status["recording"]["default_arm"], "right")
+
+        result = asyncio.run(app_module.api_record_episode({"frame_count": 3, "arm": "left"}))
+        info = self._payload(result["episode"])["info"]
+        self.assertEqual(info["arm"], "left")
+        self.assertEqual(info["joint_order"][0], "left_shoulder_pitch")
+        self.assertEqual(info["measured_q_rad"], [i / 100.0 for i in range(15, 22)])
+
+        bad = asyncio.run(app_module.api_record_episode({"frame_count": 3, "arm": "both"}))
+        self.assertEqual(bad.status_code, 400)
 
     def test_left_arm_episode_uses_left_schema(self):
         app_module.arm_side = "left"

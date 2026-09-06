@@ -112,7 +112,9 @@ cd frontend && npm run dev:mount-diagnostics  # http://<IP>:7015 安装标定诊
 ./start.sh
 ```
 
-默认启动方式同时提供三个页面，并共用 `teleop_data/biaoding`：
+默认启动方式同时提供三个页面。左右臂对等，用 `--arm left|right`（默认 right）
+选择；手动拍摄的 episode 落 `teleop_data/biaoding/<arm>/`，求解进度与结果落
+`handeye3d_data/biaoding/<arm>/`，两侧永不互相覆盖：
 
 - `http://<IP>:7012` 连接实时 RGB-D 和 H2 位姿；摆好姿态后按 `C`，保存一组
   `episode_*`。
@@ -135,14 +137,15 @@ cd frontend && npm run dev:mount-diagnostics  # http://<IP>:7015 安装标定诊
 
 # 等价的完整调用
 ./start.sh \
-  --teleop-task-dir ./teleop_data/biaoding \
-  --save-path ./handeye3d_data/biaoding \
+  --arm right \
+  --teleop-task-dir ./teleop_data/biaoding/right \
+  --save-path ./handeye3d_data/biaoding/right \
   --no-timestamp-dir
 ```
 
-兼容脚本默认读取 `teleop_data/biaoding`，使用
+兼容脚本默认读取 `teleop_data/biaoding/<arm>`（`CALIB_ARM=left|right`，默认 right），使用
 `config/camera/orbbec_rgbd_calibration.json`，并固定写入
-`handeye3d_data/biaoding`。也可通过环境变量覆盖：
+`handeye3d_data/biaoding/<arm>`。也可通过环境变量覆盖：
 
 ```bash
 TELEOP_TASK_DIR=/path/to/task \
@@ -197,7 +200,7 @@ episode 的每种 canonical color 仍然只能保存一个观测。
    按红 1–8、绿 1–8 的已知顺序点击同色候选即可，漏检时仍可点击普通点云。
    当前 episode 看见几个就选择并保存几个，选中第一个点后保存按钮即启用；
    再次进入同一 episode 会自动恢复已保存点并继续补选。`start.sh` 默认把进度固定
-   保存到 `handeye3d_data/biaoding/`，重启后不会因新建时间戳目录而丢失进度。
+   保存到 `handeye3d_data/biaoding/<arm>/`，重启后不会因新建时间戳目录而丢失进度。
 7. 保存配对后运行安装解算。后端使用已有 `T_cam2base` 和每个 episode 的
    `T_base_wrist`，将相机点变换到腕系，再对模型点执行刚体配准：
 

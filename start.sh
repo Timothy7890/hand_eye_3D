@@ -3,6 +3,7 @@
 #
 #   ./start.sh              # 默认：7012 采集、7013 选点、7015 查看安装标定诊断
 #   ./start.sh --no-arm     # 不启用手臂控制（只读 rt/lowstate，绝不发布，可与其他控制程序并存）
+#   ./start.sh --arm left   # 采集/求解左臂（默认 right）；数据落 .../biaoding/<left|right>/
 #   ./start.sh --teleop-task-dir /path/to/task  # 兼容的纯离线处理模式
 #   ./start.sh <其他参数>    # 其余参数原样传给 run_server.py（如 --arm-grav-in-float）
 #
@@ -67,7 +68,13 @@ ARM_ARGS=(--arm-control)
 EXTRA=()
 OFFLINE=0
 SAVE_PATH_GIVEN=0
+RECORD_DIR_GIVEN=0
+ARM_SIDE="right"          # --arm left|right：左右臂对等，数据按臂分层落盘
+EXPECT_ARM=0
 for a in "$@"; do
+  if [ "$EXPECT_ARM" -eq 1 ]; then
+    ARM_SIDE="$a"; EXPECT_ARM=0; EXTRA+=("$a"); continue
+  fi
   if [ "$a" = "--no-arm" ]; then
     ARM_ARGS=()
   else
@@ -75,9 +82,21 @@ for a in "$@"; do
     case "$a" in
       --teleop-task-dir|--teleop-task-dir=*) OFFLINE=1 ;;
       --save-path|--save-path=*) SAVE_PATH_GIVEN=1 ;;
+      --record-task-dir|--record-task-dir=*) RECORD_DIR_GIVEN=1 ;;
+      --arm) EXPECT_ARM=1 ;;
+      --arm=*) ARM_SIDE="${a#--arm=}" ;;
     esac
   fi
 done
+case "$ARM_SIDE" in
+  left|right) ;;
+  *) echo "[start] --arm 只能是 left 或 right，收到: $ARM_SIDE" >&2; exit 1 ;;
+esac
+# run_server.py 默认 right；这里显式传，保证 8132 上报的手臂与目录分层一致
+case " ${EXTRA[*]} " in
+  *" --arm "*|*" --arm="*) ;;
+  *) EXTRA+=(--arm "$ARM_SIDE") ;;
+esac
 if [ "$OFFLINE" -eq 1 ]; then
   ARM_ARGS=()
   echo "离线遥操作数据模式：不打开相机、不连接或控制机器人。"
@@ -137,10 +156,16 @@ SERVER_ARGS=(
   --network-interface "$IFACE"
   --capability-url "$CAPABILITY_URL"
 )
+# 求解进度/结果与手动拍摄的 episode 都按臂分层：<...>/biaoding/<left|right>/
 if [ "$SAVE_PATH_GIVEN" -eq 0 ]; then
-  PERSISTENT_SAVE_PATH="${CALIB_SAVE_PATH:-$PWD/handeye3d_data/biaoding}"
+  PERSISTENT_SAVE_PATH="${CALIB_SAVE_PATH:-$PWD/handeye3d_data/biaoding/$ARM_SIDE}"
   SERVER_ARGS+=(--save-path "$PERSISTENT_SAVE_PATH" --no-timestamp-dir)
-  echo "[start] 标定进度固定保存到: $PERSISTENT_SAVE_PATH"
+  echo "[start] 手臂: $ARM_SIDE  标定进度固定保存到: $PERSISTENT_SAVE_PATH"
+fi
+if [ "$RECORD_DIR_GIVEN" -eq 0 ] && [ "$OFFLINE" -eq 0 ]; then
+  RECORD_TASK_DIR="${TELEOP_TASK_DIR:-$PWD/teleop_data/biaoding/$ARM_SIDE}"
+  SERVER_ARGS+=(--record-task-dir "$RECORD_TASK_DIR")
+  echo "[start] 7012 手动拍摄的 episode 保存到: $RECORD_TASK_DIR（回放服务的 episode 在 calibration_replay_data/runs/$ARM_SIDE/）"
 fi
 if [ ${#ARM_ARGS[@]} -gt 0 ]; then
   SERVER_ARGS+=("${ARM_ARGS[@]}")

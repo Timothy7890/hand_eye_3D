@@ -4,8 +4,9 @@
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TASK_DIR="${TELEOP_TASK_DIR:-$ROOT/teleop_data/biaoding}"
-SAVE_PATH="${CALIB_SAVE_PATH:-$ROOT/handeye3d_data/biaoding}"
+ARM_SIDE="${CALIB_ARM:-right}"   # CALIB_ARM=left|right，数据按臂分层
+TASK_DIR="${TELEOP_TASK_DIR:-$ROOT/teleop_data/biaoding/$ARM_SIDE}"
+SAVE_PATH="${CALIB_SAVE_PATH:-$ROOT/handeye3d_data/biaoding/$ARM_SIDE}"
 RGBD_CALIB="${RGBD_CALIB:-$ROOT/config/camera/orbbec_rgbd_calibration.json}"
 MOUNT_CALIB="${MOUNT_CALIB:-$SAVE_PATH/handeye3d_result.json}"
 
@@ -26,6 +27,7 @@ echo "[calibration] RGB-D 标定: $RGBD_CALIB"
 echo "[calibration] 保存目录: $SAVE_PATH"
 
 ARGS=(
+  --arm "$ARM_SIDE"
   --teleop-task-dir "$TASK_DIR"
   --rgbd-calib "$RGBD_CALIB"
   --save-path "$SAVE_PATH"

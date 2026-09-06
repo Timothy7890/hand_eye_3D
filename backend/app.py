@@ -305,6 +305,9 @@ async def api_status():
             "task_dir": str(record_task_dir) if record_task_dir else None,
             "episode_count": _recorded_episode_count(),
             "frame_count": 5,
+            "default_arm": _active_arm(),
+            "arm_selectable": offline_backend is None and _record_arm_selectable(),
+            "record_dir_selectable": True,
         },
         "offline": {
             "enabled": browsing_backend is not None,
@@ -427,7 +430,17 @@ def _validated_record_request(body: dict) -> dict:
         "target_q_rad": target_q,
         "stability": stability,
         "record_dir": _validated_record_dir(body),
+        "arm": _validated_record_arm(body),
     }
+
+
+def _validated_record_arm(body: dict) -> str | None:
+    raw = body.get("arm")
+    if raw in (None, ""):
+        return None
+    if raw not in ARM_DATASET_JOINTS:
+        raise ValueError("arm 只能是 left 或 right")
+    return str(raw)
 
 
 def _episode_result(
@@ -441,6 +454,7 @@ def _episode_result(
         "run_id": info.get("run_id"),
         "waypoint_id": info.get("waypoint_id"),
         "capture_id": info.get("capture_id"),
+        "arm": info.get("arm"),
         "measured_q_rad": info.get("measured_q_rad"),
         "idempotent_replay": idempotent_replay,
     }
@@ -466,6 +480,38 @@ def _find_recorded_capture(capture_id: str, root: Path | None) -> dict | None:
     return None
 
 
+def _arm_q_reader(arm: str):
+    """返回读取指定手臂 7 关节角的无参函数（只读 rt/lowstate）。"""
+    if arm == _active_arm():
+        reader = getattr(pose_provider, "read_arm_q", None)
+        if not callable(reader):
+            raise RuntimeError(f"离线拍摄需要 --pose-source h2，以同步保存{arm}臂关节角")
+        return reader
+    read_motor_q = getattr(pose_provider, "read_motor_q", None)
+    if not callable(read_motor_q):
+        raise RuntimeError(
+            f"当前位姿来源无法读取{arm}臂关节角；请用 --pose-source h2（不带 --arm-control）"
+        )
+    from .robot import H2_LEFT_ARM_MOTOR_INDICES, H2_RIGHT_ARM_MOTOR_INDICES
+
+    indices = H2_LEFT_ARM_MOTOR_INDICES if arm == "left" else H2_RIGHT_ARM_MOTOR_INDICES
+
+    def read() -> np.ndarray:
+        values = read_motor_q(indices)
+        if values is None:
+            raise RuntimeError("还没收到 rt/lowstate")
+        return np.asarray(values, dtype=float)
+
+    return read
+
+
+def _record_arm_selectable() -> bool:
+    """回放服务据此判断能否在请求里指定 arm（旧版只会记 --arm 那条臂）。"""
+    return callable(getattr(pose_provider, "read_motor_q", None)) or callable(
+        getattr(pose_provider, "read_arm_q", None)
+    )
+
+
 def _record_episode(frame_count: int, orchestration: dict | None = None) -> dict:
     if offline_backend is not None:
         raise RuntimeError("离线处理模式不能继续拍摄")
@@ -474,16 +520,14 @@ def _record_episode(frame_count: int, orchestration: dict | None = None) -> dict
     if root is None:
         raise RuntimeError("未配置离线数据保存目录")
     root.mkdir(parents=True, exist_ok=True)
-    active_arm = _active_arm()
+    # 记录哪条臂：编排方（回放服务）可按其计划指定，否则用本服务启动时的 --arm。
+    # 两条臂的关节都在同一帧 rt/lowstate 里，读另一条臂只是换一组电机序号。
+    active_arm = orchestration.get("arm") or _active_arm()
     if active_arm not in ARM_DATASET_JOINTS:
         raise RuntimeError(f"不支持的手臂 {active_arm!r}，必须是 right 或 left")
     state_key = f"{active_arm}_arm"
     joint_order = ARM_DATASET_JOINTS[active_arm]
-    read_arm_q = getattr(pose_provider, "read_arm_q", None)
-    if not callable(read_arm_q):
-        raise RuntimeError(
-            f"离线拍摄需要 --pose-source h2，以同步保存{active_arm}臂关节角"
-        )
+    read_arm_q = _arm_q_reader(active_arm)
     calibration = RGBDCalibration.from_file(rgbd_calib_path)
     camera_info = _active_camera_info()
     if not camera_info.get("recording_supported"):
