@@ -197,6 +197,30 @@ class ReplayEpisodeRecorderTest(unittest.TestCase):
             len(list(app_module.record_task_dir.glob("episode_*/data.json"))), 1
         )
 
+    def test_record_dir_isolates_replay_runs_from_default_directory(self):
+        assert app_module.record_task_dir is not None
+        run_dir = app_module.record_task_dir.parent / "replay_runs" / "trial_a"
+        request = {
+            "frame_count": 3,
+            "capture_id": "run-a:wp-0",
+            "record_dir": str(run_dir),
+        }
+        first = asyncio.run(app_module.api_record_episode(request))
+        self.assertTrue(first["ok"])
+        self.assertEqual(first["episode"], "episode_0000")
+        self.assertEqual(first["path"], str(run_dir / "episode_0000"))
+        self.assertTrue((run_dir / "episode_0000" / "data.json").is_file())
+        self.assertEqual(list(app_module.record_task_dir.glob("episode_*")), [])
+
+        duplicate = asyncio.run(app_module.api_record_episode(request))
+        self.assertTrue(duplicate["idempotent_replay"])
+        self.assertEqual(self.camera.sequence, 3)
+
+        relative = asyncio.run(
+            app_module.api_record_episode({"frame_count": 3, "record_dir": "relative/dir"})
+        )
+        self.assertEqual(relative.status_code, 400)
+
     def test_left_arm_episode_uses_left_schema(self):
         app_module.arm_side = "left"
 

@@ -331,10 +331,9 @@ async def api_capability_hint():
     return await get_capability_hint()
 
 
-def _next_record_episode_name() -> str:
-    assert record_task_dir is not None
+def _next_record_episode_name(root: Path) -> str:
     used = []
-    for path in record_task_dir.glob("episode_*"):
+    for path in root.glob("episode_*"):
         if not path.is_dir():
             continue
         try:
@@ -373,6 +372,19 @@ def _validate_json_value(value, path: str = "stability") -> None:
             _validate_json_value(item, f"{path}.{key}")
         return
     raise ValueError(f"{path} 包含不支持的 JSON 值")
+
+
+def _validated_record_dir(body: dict) -> Path | None:
+    """回放等外部编排方可以指定本次拍摄的落盘目录（绝对路径，与默认目录隔离）。"""
+    raw = body.get("record_dir")
+    if raw in (None, ""):
+        return None
+    if not isinstance(raw, str):
+        raise ValueError("record_dir 必须是绝对路径字符串")
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        raise ValueError("record_dir 必须是绝对路径")
+    return path.resolve()
 
 
 def _validated_record_request(body: dict) -> dict:
@@ -414,16 +426,18 @@ def _validated_record_request(body: dict) -> dict:
         "capture_id": _validated_record_id(body, "capture_id"),
         "target_q_rad": target_q,
         "stability": stability,
+        "record_dir": _validated_record_dir(body),
     }
 
 
-def _episode_result(episode_name: str, info: dict, *, idempotent_replay: bool) -> dict:
-    assert record_task_dir is not None
+def _episode_result(
+    episode_name: str, info: dict, *, root: Path, idempotent_replay: bool
+) -> dict:
     return {
         "ok": True,
         "episode": episode_name,
         "frame_count": int(info["frame_count"]),
-        "path": str(record_task_dir / episode_name),
+        "path": str(root / episode_name),
         "run_id": info.get("run_id"),
         "waypoint_id": info.get("waypoint_id"),
         "capture_id": info.get("capture_id"),
@@ -432,10 +446,10 @@ def _episode_result(episode_name: str, info: dict, *, idempotent_replay: bool) -
     }
 
 
-def _find_recorded_capture(capture_id: str) -> dict | None:
-    if record_task_dir is None or not record_task_dir.is_dir():
+def _find_recorded_capture(capture_id: str, root: Path | None) -> dict | None:
+    if root is None or not root.is_dir():
         return None
-    for data_path in sorted(record_task_dir.glob("episode_*/data.json")):
+    for data_path in sorted(root.glob("episode_*/data.json")):
         try:
             payload = json.loads(data_path.read_text(encoding="utf-8"))
             info = payload["info"]
@@ -445,7 +459,7 @@ def _find_recorded_capture(capture_id: str) -> dict | None:
                 and info.get("capture_id") == capture_id
             ):
                 return _episode_result(
-                    data_path.parent.name, info, idempotent_replay=True
+                    data_path.parent.name, info, root=root, idempotent_replay=True
                 )
         except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
             continue
@@ -455,9 +469,11 @@ def _find_recorded_capture(capture_id: str) -> dict | None:
 def _record_episode(frame_count: int, orchestration: dict | None = None) -> dict:
     if offline_backend is not None:
         raise RuntimeError("离线处理模式不能继续拍摄")
-    if record_task_dir is None:
-        raise RuntimeError("未配置离线数据保存目录")
     orchestration = orchestration or {}
+    root = orchestration.get("record_dir") or record_task_dir
+    if root is None:
+        raise RuntimeError("未配置离线数据保存目录")
+    root.mkdir(parents=True, exist_ok=True)
     active_arm = _active_arm()
     if active_arm not in ARM_DATASET_JOINTS:
         raise RuntimeError(f"不支持的手臂 {active_arm!r}，必须是 right 或 left")
@@ -481,9 +497,9 @@ def _record_episode(frame_count: int, orchestration: dict | None = None) -> dict
             f"相机序列号 {camera_info['serial']} 与 RGB-D 标定 {calibration.serial} 不一致"
         )
 
-    episode_name = _next_record_episode_name()
-    final_root = record_task_dir / episode_name
-    temp_root = record_task_dir / f".{episode_name}-{uuid.uuid4().hex}.tmp"
+    episode_name = _next_record_episode_name(root)
+    final_root = root / episode_name
+    temp_root = root / f".{episode_name}-{uuid.uuid4().hex}.tmp"
     rgb_dir = temp_root / "rgb"
     depth_dir = temp_root / "depth"
     rgb_dir.mkdir(parents=True)
@@ -593,7 +609,7 @@ def _record_episode(frame_count: int, orchestration: dict | None = None) -> dict
     except Exception:
         shutil.rmtree(temp_root, ignore_errors=True)
         raise
-    return _episode_result(episode_name, info, idempotent_replay=False)
+    return _episode_result(episode_name, info, root=root, idempotent_replay=False)
 
 
 @app.post("/api/record/episode")
@@ -608,7 +624,9 @@ async def api_record_episode(body: dict | None = None):
     try:
         if request["capture_id"]:
             existing = await asyncio.to_thread(
-                _find_recorded_capture, request["capture_id"]
+                _find_recorded_capture,
+                request["capture_id"],
+                request["record_dir"] or record_task_dir,
             )
             if existing is not None:
                 return existing
