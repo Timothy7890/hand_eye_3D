@@ -17,13 +17,17 @@ const showLines = ref(true)
 const showLabels = ref(true)
 const pointCloudFrontendUrl = `${window.location.protocol}//${window.location.hostname}:7013`
 
+const POINT_GROUPS = {
+  'palm-red': { name: '红', color: '#ef4444' },
+  'back-green': { name: '绿', color: '#22c55e' },
+  'side-yellow': { name: '黄', color: '#eab308' },
+  'side-pink': { name: '粉', color: '#ec4899' },
+}
 const pointInfo = (pointId) => {
   const number = Number(pointId?.split('-').at(-1))
-  const red = pointId?.startsWith('palm-red-')
-  return {
-    label: `${red ? '红' : '绿'}${number}`,
-    color: red ? '#ef4444' : '#22c55e',
-  }
+  const prefix = pointId?.split('-').slice(0, -1).join('-')
+  const group = POINT_GROUPS[prefix] || { name: '?', color: '#9ca3af' }
+  return { label: `${group.name}${number}`, color: group.color }
 }
 
 const selectedPose = computed(() =>
@@ -499,6 +503,8 @@ onBeforeUnmount(() => {
             <div><span>模型点</span><b>{{ diagnostics.summary.point_count }}/16</b></div>
             <div><span>红点 RMS</span><b>{{ diagnostics.summary.by_color.red.rms.toFixed(2) }} mm</b></div>
             <div><span>绿点 RMS</span><b>{{ diagnostics.summary.by_color.green.rms.toFixed(2) }} mm</b></div>
+            <div v-if="diagnostics.summary.by_color.yellow?.count"><span>黄点 RMS</span><b>{{ diagnostics.summary.by_color.yellow.rms.toFixed(2) }} mm</b></div>
+            <div v-if="diagnostics.summary.by_color.pink?.count"><span>粉点 RMS</span><b>{{ diagnostics.summary.by_color.pink.rms.toFixed(2) }} mm</b></div>
           </div>
         </section>
 

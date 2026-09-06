@@ -36,10 +36,21 @@ router = APIRouter()
 
 MOUNT_DEPTH_MIN_M = 0.30
 MOUNT_DEPTH_MAX_M = 1.5
-MOUNT_POINT_ID_RE = re.compile(r"^(?:palm-red|back-green)-(?:0[1-8])$")
+# 槽位：手心红 8、手背绿 8、手侧黄 2、手侧粉 2（手侧 = 既非手心也非手背的两个侧面）
+MOUNT_POINT_GROUPS: dict[str, tuple[str, str, int]] = {
+    # prefix → (中文色名, 颜色 id, 数量)
+    "palm-red": ("红", "red", 8),
+    "back-green": ("绿", "green", 8),
+    "side-yellow": ("黄", "yellow", 2),
+    "side-pink": ("粉", "pink", 2),
+}
+MOUNT_POINT_ID_RE = re.compile(
+    r"^(?:palm-red-0[1-8]|back-green-0[1-8]|side-yellow-0[12]|side-pink-0[12])$"
+)
 MOUNT_PROFILE_POINT_IDS = tuple(
-    [f"palm-red-{index:02d}" for index in range(1, 9)]
-    + [f"back-green-{index:02d}" for index in range(1, 9)]
+    f"{prefix}-{index:02d}"
+    for prefix, (_, _, count) in MOUNT_POINT_GROUPS.items()
+    for index in range(1, count + 1)
 )
 MOUNT_PROFILE_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 MOUNT_PROFILE_NAME_MAX_LENGTH = 128
@@ -430,8 +441,8 @@ def _mount_calibration_catalog() -> tuple[list[dict[str, Any]], str | None]:
 def _validate_mount_point_id(point_id: Any, position: int) -> str:
     if not isinstance(point_id, str) or not MOUNT_POINT_ID_RE.fullmatch(point_id.strip()):
         raise ValueError(
-            f"第 {position} 个 point_id 必须是 palm-red-01..08 "
-            "或 back-green-01..08"
+            f"第 {position} 个 point_id 必须是 palm-red-01..08、back-green-01..08、"
+            "side-yellow-01..02 或 side-pink-01..02"
         )
     return point_id.strip()
 
@@ -1122,10 +1133,9 @@ def _diagnostic_stats(values_mm: list[float]) -> dict[str, float | int]:
 
 
 def _mount_point_display(point_id: str) -> tuple[str, str]:
-    number = int(point_id.rsplit("-", 1)[-1])
-    if point_id.startswith("palm-red-"):
-        return f"红{number}", "red"
-    return f"绿{number}", "green"
+    prefix, _, number = point_id.rpartition("-")
+    name, color, _ = MOUNT_POINT_GROUPS.get(prefix, ("?", "gray", 0))
+    return f"{name}{int(number)}", color
 
 
 def _best_same_color_swap(
@@ -1150,7 +1160,7 @@ def _best_same_color_swap(
     best_rms = current_rms
     best_pair: list[str] | None = None
     tested = 0
-    for prefix in ("palm-red-", "back-green-"):
+    for prefix in (f"{group}-" for group in MOUNT_POINT_GROUPS):
         point_ids = sorted(
             point_id for point_id in point_by_id if point_id.startswith(prefix)
         )
@@ -1293,7 +1303,7 @@ async def api_mount_diagnostics():
                 if observation["color"] == color
             ]
         )
-        for color in ("red", "green")
+        for color in dict.fromkeys(color for _, color, _ in MOUNT_POINT_GROUPS.values())
     }
 
     current_indices = {sample.get("index") for sample in samples}
