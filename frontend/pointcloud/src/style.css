@@ -1481,3 +1481,96 @@ button:disabled {
 .mount-slot small.missing-model {
   color: #f6ad55;
 }
+
+
+/* 两步法解算 */
+.stage-block {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid #253247;
+  border-radius: 10px;
+  background: #0d1421;
+}
+
+.stage-head {
+  display: grid;
+  gap: 3px;
+}
+
+.stage-head b {
+  font-size: 13px;
+  color: #e5edf7;
+}
+
+.stage-head small {
+  color: #8494ab;
+  line-height: 1.45;
+}
+
+.outlier-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 4px;
+  font-size: 12px;
+  color: #f2b8b5;
+}
+
+.outlier-list li {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.outlier-list i,
+.stage-row i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  display: inline-block;
+  margin-right: 4px;
+}
+
+.outlier-list a {
+  color: #8fc1ff;
+}
+
+.stage-table {
+  display: grid;
+  gap: 2px;
+  font-size: 12px;
+}
+
+.stage-row {
+  display: grid;
+  grid-template-columns: 42px 1fr 52px 74px 70px;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  color: #d5deeb;
+}
+
+.stage-row.head {
+  color: #8494ab;
+  font-size: 11px;
+}
+
+.stage-row:not(.head):hover {
+  background: #17223a;
+}
+
+.stage-row.excluded {
+  color: #6c7a90;
+  text-decoration: line-through;
+}
+
+.stage-row.no-model {
+  color: #8a94a6;
+}
+
+.stage-row input {
+  margin: 0;
+}

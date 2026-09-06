@@ -57,6 +57,10 @@ const selectedMountCalibPath = ref('')
 const mountCalibBusy = ref(false)
 const mountResult = ref(null)
 const mountResultStale = ref(false)
+// 两步法：① 点云一致性（只用实体点） ② 安装解算（模型点 + 各贴纸均值）
+const mountConsistency = ref(null)
+const mountConsistencyBusy = ref(false)
+const mountExcludedIds = ref(new Set())   // 第二步不信任、排除的贴纸
 const mountResultCard = ref(null)
 const overlayVisible = ref(false)
 const mountViewport = ref('model')
@@ -289,6 +293,38 @@ const mountTransformSummary = computed(() => {
       .map((value) => (Number(value) * 1000).toFixed(2)),
     rpyDeg: (mountResult.value.rpy_deg || [])
       .map((value) => Number(value).toFixed(2)),
+  }
+})
+// 两步法表格的行：一致性结果优先，否则用最近一次解算里的 stage1
+const mountStagePoints = computed(() => {
+  const points = mountConsistency.value?.points || mountResult.value?.stage1?.points || []
+  const stage2 = new Map((mountResult.value?.stage2?.points || []).map((p) => [p.point_id, p]))
+  return points.map((p) => ({
+    ...p,
+    stage2: stage2.get(p.point_id) || null,
+    excluded: mountExcludedIds.value.has(p.point_id),
+    slot: mountSlotInfo(p.point_id),
+  }))
+})
+const mountStage2Eligible = computed(() =>
+  mountStagePoints.value.filter((p) => p.has_model_point && !p.excluded).length,
+)
+const mountStage1Summary = computed(() => {
+  const stats = (mountConsistency.value || mountResult.value?.stage1)?.stats_mm
+  if (!stats) return null
+  return { rms: Number(stats.rms).toFixed(2), max: Number(stats.max).toFixed(2), count: stats.count }
+})
+const mountStage1Outliers = computed(() =>
+  (mountConsistency.value || mountResult.value?.stage1)?.outliers || [],
+)
+const mountStage2Summary = computed(() => {
+  const stats = mountResult.value?.stage2?.residual_mm
+  if (!stats) return null
+  return {
+    rms: Number(stats.rms).toFixed(2),
+    median: Number(stats.median).toFixed(2),
+    max: Number(stats.max).toFixed(2),
+    count: mountResult.value.stage2.point_count,
   }
 })
 const mountLooSummary = computed(() => {
@@ -1664,6 +1700,47 @@ async function deleteMountSample(index) {
   }
 }
 
+async function runMountConsistency() {
+  if (!selectedMountCalibPath.value) {
+    errorMsg.value = '请选择一份与当前相机匹配的相机外参'
+    return
+  }
+  mountConsistencyBusy.value = true
+  errorMsg.value = ''
+  infoMsg.value = ''
+  try {
+    const response = await fetch('/api/mount/consistency', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ calib_path: selectedMountCalibPath.value }),
+    })
+    if (!response.ok) throw await responseError(response, '点云一致性检查失败')
+    mountConsistency.value = await response.json()
+    const c = mountConsistency.value
+    const outliers = c.outliers?.length || 0
+    infoMsg.value = c.stats_mm
+      ? `① 一致性：${c.point_count} 张贴纸 · ${c.pose_count} 个姿态 · 跨姿态 RMS ${Number(c.stats_mm.rms).toFixed(2)} mm${outliers ? ` · ${outliers} 个离群观测` : ''}`
+      : `① 一致性：每张贴纸只在 1 个姿态出现，无法评估；多拍几个姿态`
+  } catch (error) {
+    setError(error)
+  } finally {
+    mountConsistencyBusy.value = false
+  }
+}
+
+function toggleMountExcluded(pointId) {
+  const next = new Set(mountExcludedIds.value)
+  if (next.has(pointId)) next.delete(pointId)
+  else next.add(pointId)
+  mountExcludedIds.value = next
+  if (mountResult.value) mountResultStale.value = true
+}
+
+async function jumpToStage1Pose(poseId) {
+  if (!poseId || poseId === selectedEpisode.value) return
+  if (episodes.value.some((e) => e.name === poseId)) await selectEpisode(poseId)
+}
+
 async function solveMount() {
   if (!selectedMountCalibPath.value) {
     errorMsg.value = '请选择一份与当前相机匹配的相机外参'
@@ -1676,12 +1753,17 @@ async function solveMount() {
     const response = await fetch('/api/mount/solve', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ calib_path: selectedMountCalibPath.value }),
+      body: JSON.stringify({
+        calib_path: selectedMountCalibPath.value,
+        exclude_point_ids: [...mountExcludedIds.value],
+      }),
     })
     if (!response.ok) throw await responseError(response, '手安装解算失败')
     mountResult.value = await response.json()
     mountResultStale.value = false
-    infoMsg.value = `手安装解算完成：RMS ${Number(mountResult.value.residual_mm?.rms).toFixed(2)} mm`
+    if (mountResult.value.stage1) mountConsistency.value = mountResult.value.stage1
+    const s2 = mountResult.value.stage2?.residual_mm
+    infoMsg.value = `② 解算完成：${mountResult.value.point_count} 张贴纸参与，逐贴纸 RMS ${Number(s2?.rms).toFixed(2)} mm（最大 ${Number(s2?.max).toFixed(2)} mm）`
     clearOverlay()
     if (overlayVisible.value) buildOverlay()
     await nextTick()
@@ -2515,21 +2597,86 @@ onBeforeUnmount(() => {
               </div>
             </div>
             <p v-else class="episode-sample-hint">当前 episode 尚无已保存安装样本</p>
-            <button
-              class="solve-button"
-              :disabled="
-                mountSolveBusy
-                || mountSamples.length < mountMinPoints
-                || !selectedMountCalibPath
-              "
-              @click="solveMount"
-            >
-              {{ mountSolveBusy ? '解算中…' : `解算并显示结果（至少 ${mountMinPoints} 点）` }}
-            </button>
-            <div v-if="mountResidualSummary" class="result-summary">
-              <div><span>RMS</span><strong>{{ mountResidualSummary.rms }} mm</strong></div>
-              <div><span>Median</span><strong>{{ mountResidualSummary.median }} mm</strong></div>
-              <div><span>Max</span><strong>{{ mountResidualSummary.max }} mm</strong></div>
+
+            <div class="stage-block">
+              <div class="stage-head">
+                <b>① 点云一致性</b>
+                <small>只用实体点，不需要模型点。同一贴纸在各姿态搬到腕系后应重合；离散度 = 外参 + FK + 选点误差</small>
+              </div>
+              <button
+                class="secondary-button"
+                :disabled="mountConsistencyBusy || !mountSamples.length || !selectedMountCalibPath"
+                @click="runMountConsistency"
+              >
+                {{ mountConsistencyBusy ? '检查中…' : '运行一致性检查' }}
+              </button>
+              <div v-if="mountStage1Summary" class="result-summary">
+                <div><span>跨姿态 RMS</span><strong>{{ mountStage1Summary.rms }} mm</strong></div>
+                <div><span>最大偏差</span><strong>{{ mountStage1Summary.max }} mm</strong></div>
+                <div><span>观测</span><strong>{{ mountStage1Summary.count }}</strong></div>
+              </div>
+              <ul v-if="mountStage1Outliers.length" class="outlier-list">
+                <li v-for="o in mountStage1Outliers" :key="o.point_id + o.pose_id">
+                  <i :style="{ background: mountSlotInfo(o.point_id).color }"></i>
+                  {{ mountSlotInfo(o.point_id).shortLabel }} @
+                  <a href="#" @click.prevent="jumpToStage1Pose(o.pose_id)">{{ o.pose_id }}</a>
+                  偏 {{ Number(o.deviation_mm).toFixed(1) }} mm，已从均值剔除
+                </li>
+              </ul>
+            </div>
+
+            <div v-if="mountStagePoints.length" class="stage-table">
+              <div class="stage-row head">
+                <span>参与②</span><span>贴纸</span><span>姿态数</span><span>①离散 RMS</span><span>②残差</span>
+              </div>
+              <label
+                v-for="p in mountStagePoints"
+                :key="p.point_id"
+                class="stage-row"
+                :class="{ excluded: p.excluded, 'no-model': !p.has_model_point }"
+                :title="p.has_model_point ? '' : '缺模型点，只参与①'"
+              >
+                <span>
+                  <input
+                    type="checkbox"
+                    :checked="p.has_model_point && !p.excluded"
+                    :disabled="!p.has_model_point"
+                    @change="toggleMountExcluded(p.point_id)"
+                  />
+                </span>
+                <span><i :style="{ background: p.slot.color }"></i>{{ p.slot.shortLabel }}</span>
+                <span>{{ p.used_pose_count ?? p.pose_count }}<template v-if="p.used_pose_count != null && p.used_pose_count !== p.pose_count">/{{ p.pose_count }}</template></span>
+                <span>{{ p.spread_mm ? Number(p.spread_mm.rms).toFixed(2) : '—' }}</span>
+                <span>
+                  <template v-if="!p.has_model_point">缺模型点</template>
+                  <template v-else-if="p.excluded">已排除</template>
+                  <template v-else-if="p.stage2">{{ Number(p.stage2.residual_mm).toFixed(2) }}</template>
+                  <template v-else>—</template>
+                </span>
+              </label>
+            </div>
+
+            <div class="stage-block">
+              <div class="stage-head">
+                <b>② 安装解算</b>
+                <small>每张贴纸取①的均值，与模型点做 Kabsch 求 T_wrist2hand；残差 = 贴纸位置 vs 模型标注偏差。取消勾选即排除不信任的贴纸</small>
+              </div>
+              <button
+                class="solve-button"
+                :disabled="
+                  mountSolveBusy
+                  || mountSamples.length < mountMinPoints
+                  || !selectedMountCalibPath
+                "
+                @click="solveMount"
+              >
+                {{ mountSolveBusy ? '解算中…' : `解算并显示结果（${mountStagePoints.length ? `${mountStage2Eligible} 张贴纸参与，` : ''}至少 ${mountMinPoints}）` }}
+              </button>
+              <div v-if="mountStage2Summary" class="result-summary">
+                <div><span>逐贴纸 RMS</span><strong>{{ mountStage2Summary.rms }} mm</strong></div>
+                <div><span>中位</span><strong>{{ mountStage2Summary.median }} mm</strong></div>
+                <div><span>最大</span><strong>{{ mountStage2Summary.max }} mm</strong></div>
+              </div>
             </div>
             <button
               v-if="mountResult"
@@ -2550,9 +2697,9 @@ onBeforeUnmount(() => {
               <div>
                 <h2>安装标定结果</h2>
                 <span>
-                  {{ mountResult.num_samples }} 个样本 ·
+                  {{ mountResult.num_samples }} 个观测 ·
                   {{ mountResult.pose_count }} 个姿态 ·
-                  {{ mountResult.point_count }} 个模型点
+                  {{ mountResult.point_count }} 张贴纸<template v-if="mountResult.excluded_point_ids?.length">（排除 {{ mountResult.excluded_point_ids.length }}）</template>
                 </span>
               </div>
               <strong
@@ -2579,7 +2726,9 @@ onBeforeUnmount(() => {
               {{ mountQualitySummary.message }}
             </p>
             <div class="mount-result-metrics">
-              <div><span>拟合 RMS</span><strong>{{ mountResidualSummary.rms }} mm</strong></div>
+              <div v-if="mountStage1Summary"><span>① 跨姿态 RMS</span><strong>{{ mountStage1Summary.rms }} mm</strong></div>
+              <div v-if="mountStage2Summary"><span>② 逐贴纸 RMS</span><strong>{{ mountStage2Summary.rms }} mm</strong></div>
+              <div><span>逐观测 RMS</span><strong>{{ mountResidualSummary.rms }} mm</strong></div>
               <div><span>中位误差</span><strong>{{ mountResidualSummary.median }} mm</strong></div>
               <div><span>最大误差</span><strong>{{ mountResidualSummary.max }} mm</strong></div>
               <div v-if="mountLooSummary">

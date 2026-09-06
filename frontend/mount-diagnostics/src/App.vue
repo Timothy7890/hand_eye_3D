@@ -39,7 +39,10 @@ const selectedObservation = computed(() =>
   ) || null,
 )
 const sortedPointStats = computed(() =>
-  [...(diagnostics.value?.point_stats || [])].sort((left, right) => right.rms - left.rms),
+  [...(diagnostics.value?.point_stats || [])].sort((left, right) => {
+    const key = (p) => (p.excluded ? -1 : (p.stage2_residual_mm ?? p.rms))
+    return key(right) - key(left)
+  }),
 )
 const looStats = computed(() => {
   const loo = diagnostics.value?.summary?.leave_one_pose_out
@@ -495,12 +498,20 @@ onBeforeUnmount(() => {
           </div>
           <p>{{ quality.detail }}</p>
           <div class="metric-grid">
-            <div><span>RMS</span><b>{{ diagnostics.summary.rms.toFixed(2) }} mm</b></div>
+            <template v-if="diagnostics.summary.two_stage">
+              <div v-if="diagnostics.summary.stage1_stats_mm" title="① 只用点云：同一贴纸跨姿态离散度（外参+FK+选点误差）">
+                <span>① 跨姿态 RMS</span><b>{{ diagnostics.summary.stage1_stats_mm.rms.toFixed(2) }} mm</b>
+              </div>
+              <div title="② 每张贴纸均值 vs 模型点（贴纸位置/标注偏差）">
+                <span>② 逐贴纸 RMS</span><b>{{ diagnostics.summary.stage2_stats_mm.rms.toFixed(2) }} mm</b>
+              </div>
+            </template>
+            <div><span>逐观测 RMS</span><b>{{ diagnostics.summary.rms.toFixed(2) }} mm</b></div>
             <div><span>最大</span><b>{{ diagnostics.summary.max.toFixed(2) }} mm</b></div>
             <div><span>样本</span><b>{{ diagnostics.summary.sample_count }}</b></div>
             <div><span>姿态</span><b>{{ diagnostics.summary.pose_count }}</b></div>
             <div v-if="looStats"><span>跨姿态 RMS</span><b>{{ looStats.rms.toFixed(2) }} mm</b></div>
-            <div><span>模型点</span><b>{{ diagnostics.summary.point_count }}/16</b></div>
+            <div><span>贴纸</span><b>{{ diagnostics.summary.point_count }}<template v-if="diagnostics.summary.excluded_point_ids?.length">（排除 {{ diagnostics.summary.excluded_point_ids.length }}）</template></b></div>
             <div><span>红点 RMS</span><b>{{ diagnostics.summary.by_color.red.rms.toFixed(2) }} mm</b></div>
             <div><span>绿点 RMS</span><b>{{ diagnostics.summary.by_color.green.rms.toFixed(2) }} mm</b></div>
             <div v-if="diagnostics.summary.by_color.yellow?.count"><span>黄点 RMS</span><b>{{ diagnostics.summary.by_color.yellow.rms.toFixed(2) }} mm</b></div>
@@ -622,18 +633,26 @@ onBeforeUnmount(() => {
 
         <section class="card point-ranking">
           <div class="card-heading">
-            <span>各编号总体误差</span>
-            <small>从高到低</small>
+            <span>各贴纸误差</span>
+            <small>{{ diagnostics.summary.two_stage ? '①离散 / ②残差 · 按②从高到低' : '从高到低' }}</small>
           </div>
           <div
             v-for="point in sortedPointStats"
             :key="point.point_id"
-            :class="{ bad: point.rms > 10, warning: point.rms > 5 && point.rms <= 10 }"
+            :class="{ bad: point.rms > 10, warning: point.rms > 5 && point.rms <= 10, excluded: point.excluded }"
+            :title="point.excluded ? '第二步已排除' : ''"
           >
             <i :style="{ background: pointInfo(point.point_id).color }"></i>
             <strong>{{ point.short_label }}</strong>
             <span>{{ point.count }} 次</span>
-            <code>{{ point.rms.toFixed(2) }} mm</code>
+            <code v-if="diagnostics.summary.two_stage">
+              <template v-if="point.stage1_spread_rms_mm != null">①{{ point.stage1_spread_rms_mm.toFixed(2) }}</template><template v-else>①—</template>
+              /
+              <template v-if="point.excluded">②排除</template>
+              <template v-else-if="point.stage2_residual_mm != null">②{{ point.stage2_residual_mm.toFixed(2) }}</template>
+              <template v-else>②—</template>
+            </code>
+            <code v-else>{{ point.rms.toFixed(2) }} mm</code>
           </div>
         </section>
 

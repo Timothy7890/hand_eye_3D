@@ -573,6 +573,7 @@ class MountApiTest(unittest.TestCase):
         self.assertTrue(merged_path.is_file())
         merged = json.loads(merged_path.read_text())
         np.testing.assert_allclose(merged["T_wrist2hand"], T_mount, atol=1e-9)
+
         self.assertEqual(merged["hand_id"], HAND_ID)
         np.testing.assert_allclose(
             merged["R_cam2base"], T_cam2base[:3, :3], atol=1e-12
@@ -607,6 +608,26 @@ class MountApiTest(unittest.TestCase):
         self.assertEqual(len(diagnostic_payload["poses"][0]["observations"]), 5)
         self.client.delete("/api/mount/samples/0")
         self.assertTrue(self.client.get("/api/mount/result").json()["stale"])
+
+        # 两步法：第一步只用点云的一致性接口 + 结果中的 stage1/stage2；排除贴纸后仍可解
+        consistency = self.client.post("/api/mount/consistency", json={}).json()
+        self.assertTrue(consistency["ok"], consistency)
+        self.assertEqual(consistency["pose_count"], 3)
+        self.assertTrue(all(p["has_model_point"] for p in consistency["points"]))
+        self.assertLess(consistency["stats_mm"]["rms"], 1e-6)
+        self.assertEqual(result["mode"], "hand_mount_two_stage")
+        self.assertEqual(result["stage2"]["point_count"], len(consistency["points"]))
+        excluded_id = consistency["points"][0]["point_id"]
+        excluded = self.client.post(
+            "/api/mount/solve", json={"exclude_point_ids": [excluded_id]}
+        ).json()
+        self.assertTrue(excluded["ok"], excluded)
+        self.assertEqual(excluded["excluded_point_ids"], [excluded_id])
+        self.assertNotIn(excluded_id, excluded["point_ids"])
+        np.testing.assert_allclose(excluded["T_wrist2hand"], T_mount, atol=1e-9)
+        diagnostics = self.client.get("/api/mount/diagnostics").json()
+        self.assertTrue(diagnostics["summary"]["two_stage"])
+        self.assertEqual(diagnostics["summary"]["excluded_point_ids"], [excluded_id])
 
     def test_batch_rejects_bad_depth_and_schema(self):
         observations, _, _ = self._synthetic_batch()

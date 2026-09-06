@@ -27,8 +27,9 @@ from .offline import EpisodeValidationError, PointCloudStaleError
 from .paths import PROJECT_ROOT
 from .solver import (
     MIN_MOUNT_POINTS,
-    leave_one_pose_out_mount,
-    solve_hand_mount,
+    leave_one_pose_out_two_stage,
+    mount_point_consistency,
+    solve_hand_mount_two_stage,
     solve_rigid_transform,
 )
 
@@ -1371,18 +1372,32 @@ async def api_mount_diagnostics():
                 "observations": pose_observations,
             }
         )
+    # 两步法信息（旧结果文件没有则为空）
+    stage1 = result.get("stage1") or {}
+    stage2 = result.get("stage2") or {}
+    stage1_by_point = {p["point_id"]: p for p in stage1.get("points", [])}
+    stage2_by_point = {p["point_id"]: p for p in stage2.get("points", [])}
+    excluded_ids = set(result.get("excluded_point_ids") or [])
     point_stats = []
     for point_id, point_observations in sorted(by_point.items()):
         stats = _diagnostic_stats(
             [observation["residual_mm"] for observation in point_observations]
         )
         short_label, color = _mount_point_display(point_id)
+        s1 = stage1_by_point.get(point_id)
+        s2 = stage2_by_point.get(point_id)
         point_stats.append(
             {
                 "point_id": point_id,
                 "short_label": short_label,
                 "color": color,
                 **stats,
+                "excluded": point_id in excluded_ids,
+                "stage1_spread_rms_mm": (
+                    float(s1["spread_mm"]["rms"]) if s1 and s1.get("spread_mm") else None
+                ),
+                "stage1_pose_count": int(s1["pose_count"]) if s1 else None,
+                "stage2_residual_mm": float(s2["residual_mm"]) if s2 else None,
             }
         )
     color_stats = {
@@ -1415,6 +1430,12 @@ async def api_mount_diagnostics():
             ),
             "by_color": color_stats,
             "leave_one_pose_out": result.get("leave_one_pose_out"),
+            "two_stage": bool(stage1 and stage2),
+            "stage1_stats_mm": stage1.get("stats_mm"),
+            "stage1_outliers": stage1.get("outliers") or [],
+            "stage2_stats_mm": stage2.get("residual_mm"),
+            "stage2_point_count": stage2.get("point_count"),
+            "excluded_point_ids": sorted(excluded_ids),
         },
         "order_check": await asyncio.to_thread(
             _best_same_color_swap, samples, observed_wrist
@@ -1427,65 +1448,152 @@ async def api_mount_diagnostics():
     }
 
 
-@router.post("/api/mount/solve")
-async def api_mount_solve(body: dict | None = None):
-    """固定 T_cam2base，解 T_wrist2hand。Body 可选: {"calib_path": "..."}。"""
-    state = _state()
-    body = body or {}
+def _resolve_mount_calib_path(state, body: dict) -> Path | None:
     if body.get("calib_path"):
-        calib_path = Path(body["calib_path"]).expanduser().resolve()
-    elif state.mount_calib_path is not None:
-        calib_path = state.mount_calib_path
-    else:
-        calib_path = state._find_latest_calib()
+        return Path(body["calib_path"]).expanduser().resolve()
+    if state.mount_calib_path is not None:
+        return state.mount_calib_path
+    return state._find_latest_calib()
+
+
+def _wrist_points(samples: list[dict], R_cam: np.ndarray, t_cam: np.ndarray) -> np.ndarray:
+    """相机点 → 基座系 → 腕系（每条样本用自己 episode 的 FK 腕位姿）。"""
+    p_camera = np.array([sample["p_camera"] for sample in samples], dtype=float)
+    T_wrist = np.array([sample["T_base_wrist"] for sample in samples], dtype=float)
+    p_base = (R_cam @ p_camera.T).T + t_cam
+    return np.stack(
+        [
+            np.linalg.solve(T_wrist[i], np.array([*p_base[i], 1.0]))[:3]
+            for i in range(len(samples))
+        ]
+    )
+
+
+async def _prepare_mount_solve(body: dict):
+    """公共前置：外参、样本校验、腕系坐标。返回 (ctx, None) 或 (None, JSONResponse)。"""
+    state = _state()
+    calib_path = _resolve_mount_calib_path(state, body)
     if calib_path is None or not calib_path.is_file():
-        return JSONResponse(
+        return None, JSONResponse(
             {
                 "ok": False,
-                "error": "找不到手安装使用的相机外参，"
-                "请通过 --mount-calib 或 calib_path 指定",
+                "error": "找不到手安装使用的相机外参，请通过 --mount-calib 或 calib_path 指定",
             },
             status_code=400,
         )
     try:
         calib, R_cam, t_cam, calib_identity = _load_mount_calibration(calib_path)
     except ValueError as exc:
-        return JSONResponse(
-            {"ok": False, "error": str(exc)}, status_code=400
-        )
+        return None, JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
     samples = _load_mount_samples()
     if not samples:
-        return JSONResponse(
-            {"ok": False, "error": "没有手安装标定样本"}, status_code=400
-        )
-    samples, missing_model = _split_mount_samples(samples)
-    if not samples:
-        return JSONResponse(
-            {
-                "ok": False,
-                "error": f"{len(missing_model)} 条样本只有实体点、没有模型点；"
-                "请在「零位手模型」标注模型点后点「写入已保存样本」再解算",
-            },
-            status_code=400,
-        )
+        return None, JSONResponse({"ok": False, "error": "没有手安装标定样本"}, status_code=400)
     try:
         samples = [
             _validated_mount_observation(sample, position)
             for position, sample in enumerate(samples)
         ]
     except ValueError as exc:
-        return JSONResponse(
+        return None, JSONResponse(
             {"ok": False, "error": f"已有安装样本与当前会话不一致: {exc}"},
             status_code=409,
         )
     hand_ids = {sample.get("hand_id") for sample in samples}
     if len(hand_ids) != 1:
-        return JSONResponse(
+        return None, JSONResponse(
             {"ok": False, "error": f"样本包含多个手型号: {sorted(hand_ids)}"},
             status_code=400,
         )
     hand_id = next(iter(hand_ids))
+    p_wrist = _wrist_points(samples, R_cam, t_cam)
+    # 模型点是"每种手一份"：同一 point_id 各样本的 p_hand 应一致，取第一条
+    p_hand_by_point: dict[str, np.ndarray] = {}
+    for sample in samples:
+        if _has_model_point(sample):
+            p_hand_by_point.setdefault(
+                sample["point_id"], np.asarray(sample["p_hand"], dtype=float)
+            )
+    return (
+        {
+            "state": state,
+            "calib_path": calib_path,
+            "calib": calib,
+            "R_cam": R_cam,
+            "t_cam": t_cam,
+            "calib_identity": calib_identity,
+            "samples": samples,
+            "hand_id": hand_id,
+            "p_wrist": p_wrist,
+            "point_ids": [sample["point_id"] for sample in samples],
+            "pose_ids": [sample["pose_id"] for sample in samples],
+            "p_hand_by_point": p_hand_by_point,
+        },
+        None,
+    )
+
+
+@router.post("/api/mount/consistency")
+async def api_mount_consistency(body: dict | None = None):
+    """第一步：只用点云。逐贴纸(point_id)统计跨 pose 一致性，不需要模型点。
+
+    Body 可选: {"calib_path": "..."}。
+    """
+    ctx, error = await _prepare_mount_solve(body or {})
+    if error is not None:
+        return error
+    try:
+        stage1 = await asyncio.to_thread(
+            mount_point_consistency, ctx["p_wrist"], ctx["point_ids"], ctx["pose_ids"]
+        )
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    for point in stage1["points"]:
+        point["has_model_point"] = point["point_id"] in ctx["p_hand_by_point"]
+        point["short_label"], point["color"] = _mount_point_display(point["point_id"])
+    return {
+        "ok": True,
+        "hand_id": ctx["hand_id"],
+        "calib_used": str(ctx["calib_path"]),
+        "sample_indices": [sample.get("index") for sample in ctx["samples"]],
+        **stage1,
+    }
+
+
+@router.post("/api/mount/solve")
+async def api_mount_solve(body: dict | None = None):
+    """两步法解 T_wrist2hand（固定 T_cam2base）。
+
+    Body 可选: {"calib_path": "...", "exclude_point_ids": ["palm-red-03", ...]}
+    第一步按贴纸聚合点云点（全部样本参与），第二步只用有模型点且未被排除的贴纸做 Kabsch。
+    """
+    body = body or {}
+    exclude_point_ids = body.get("exclude_point_ids") or []
+    if not isinstance(exclude_point_ids, list) or not all(
+        isinstance(v, str) for v in exclude_point_ids
+    ):
+        return JSONResponse(
+            {"ok": False, "error": "exclude_point_ids 必须是字符串数组"}, status_code=400
+        )
+    ctx, error = await _prepare_mount_solve(body)
+    if error is not None:
+        return error
+    state = ctx["state"]
+    calib, R_cam, t_cam, calib_identity, calib_path = (
+        ctx["calib"], ctx["R_cam"], ctx["t_cam"], ctx["calib_identity"], ctx["calib_path"]
+    )
+    samples, hand_id = ctx["samples"], ctx["hand_id"]
+    p_wrist, point_ids, pose_ids = ctx["p_wrist"], ctx["point_ids"], ctx["pose_ids"]
+    p_hand_by_point = ctx["p_hand_by_point"]
+    if not p_hand_by_point:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "所有样本都只有实体点、没有模型点；"
+                "请在「零位手模型」标注模型点后点「写入已保存样本」，或先只跑「点云一致性」",
+            },
+            status_code=400,
+        )
     capability, capability_warning, combo_error = await _require_active_combo(hand_id)
     if combo_error is not None:
         return combo_error
@@ -1495,34 +1603,25 @@ async def api_mount_solve(body: dict | None = None):
         return JSONResponse(
             {"ok": False, "error": f"样本引用的手型号不可用: {exc}"}, status_code=400
         )
-
-    p_hand = np.array([sample["p_hand"] for sample in samples], dtype=float)
-    p_camera = np.array([sample["p_camera"] for sample in samples], dtype=float)
     T_wrist = np.array([sample["T_base_wrist"] for sample in samples], dtype=float)
-    point_ids = [sample["point_id"] for sample in samples]
-    pose_ids = [sample["pose_id"] for sample in samples]
-
-    # 相机点 → 基座系 → 腕系
-    p_base = (R_cam @ p_camera.T).T + t_cam
-    p_wrist = np.stack(
-        [
-            np.linalg.solve(
-                T_wrist[i],
-                np.array([*p_base[i], 1.0]),
-            )[:3]
-            for i in range(len(samples))
-        ]
-    )
 
     try:
         result = await asyncio.to_thread(
-            solve_hand_mount, p_hand, p_wrist, point_ids, pose_ids
+            solve_hand_mount_two_stage,
+            p_hand_by_point, p_wrist, point_ids, pose_ids, exclude_point_ids,
         )
     except ValueError as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
     result["leave_one_pose_out"] = await asyncio.to_thread(
-        leave_one_pose_out_mount, p_hand, p_wrist, point_ids, pose_ids
+        leave_one_pose_out_two_stage,
+        p_hand_by_point, p_wrist, point_ids, pose_ids, exclude_point_ids,
     )
+    for point in result["stage1"]["points"]:
+        point["has_model_point"] = point["point_id"] in p_hand_by_point
+        point["short_label"], point["color"] = _mount_point_display(point["point_id"])
+    for point in result["stage2"]["points"]:
+        point["short_label"], point["color"] = _mount_point_display(point["point_id"])
+    missing_model = [s for s in samples if not _has_model_point(s)]
 
     T_mount = np.asarray(result["T_wrist2hand"], dtype=float)
     T_cam2base = np.eye(4)
@@ -1564,7 +1663,13 @@ async def api_mount_solve(body: dict | None = None):
     result["warnings"] = [capability_warning] if capability_warning else []
     if missing_model:
         result["warnings"].append(
-            f"{len(missing_model)} 条样本缺模型点，本次解算已跳过"
+            f"{len(missing_model)} 条样本缺模型点，只参与了第一步一致性，未参与第二步解算"
+        )
+    if result["stage1"]["outliers"]:
+        worst = result["stage1"]["outliers"][0]
+        result["warnings"].append(
+            f"第一步发现 {len(result['stage1']['outliers'])} 个离群观测已剔除"
+            f"（最大 {worst['point_id']}@{worst['pose_id']} 偏 {worst['deviation_mm']:.1f}mm）"
         )
     result["skipped_missing_model_points"] = len(missing_model)
     result["base_link"] = samples[0].get("base_link")

@@ -634,3 +634,8 @@ p {
     grid-template-columns: 245px minmax(360px, 1fr) 275px;
   }
 }
+
+.point-ranking > div.excluded {
+  opacity: 0.55;
+  text-decoration: line-through;
+}

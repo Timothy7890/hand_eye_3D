@@ -12,8 +12,11 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from backend.solver import (
     leave_one_pose_out_mount,
+    leave_one_pose_out_two_stage,
+    mount_point_consistency,
     rpy_to_rot,
     solve_hand_mount,
+    solve_hand_mount_two_stage,
 )
 
 # 五个近似指尖的模型点（手基座系，米），刻意不共面
@@ -151,6 +154,53 @@ class LeaveOnePoseOutMountTest(unittest.TestCase):
         report = leave_one_pose_out_mount(*_observations(1))
         self.assertFalse(report["feasible"])
         self.assertTrue(report["coverage_diagnostics"])
+
+
+class TwoStageMountTest(unittest.TestCase):
+    def test_stage1_flags_outlier_and_stage2_recovers_pose(self):
+        p_hand, p_wrist, point_ids, pose_ids = _observations(5, noise_mm=0.5)
+        p_wrist = p_wrist.copy()
+        p_wrist[2] += [0.02, 0.0, 0.0]  # 第 0 个 pose 的 tip:middle 选错 20mm
+        by_point = {pid: np.asarray(HAND_POINTS[pid]) for pid in HAND_POINTS}
+
+        stage1 = mount_point_consistency(p_wrist, point_ids, pose_ids)
+        self.assertEqual(stage1["point_count"], 5)
+        self.assertEqual(
+            [(o["point_id"], o["pose_id"]) for o in stage1["outliers"]],
+            [("tip:middle", "episode_0000")],
+        )
+
+        result = solve_hand_mount_two_stage(by_point, p_wrist, point_ids, pose_ids)
+        self.assertEqual(result["mode"], "hand_mount_two_stage")
+        np.testing.assert_allclose(result["R_wrist2hand"], R_TRUE, atol=2e-2)
+        np.testing.assert_allclose(result["t_wrist2hand_m"], T_TRUE, atol=2e-3)
+        self.assertLess(result["stage2"]["residual_mm"]["rms"], 1.5)
+        self.assertEqual(result["stage1"]["points"][0]["pose_count"], 5)
+
+    def test_exclude_and_missing_model_points_only_join_stage1(self):
+        p_hand, p_wrist, point_ids, pose_ids = _observations(3)
+        by_point = {pid: np.asarray(HAND_POINTS[pid]) for pid in HAND_POINTS}
+        del by_point["tip:pinky"]  # 缺模型点
+        result = solve_hand_mount_two_stage(
+            by_point, p_wrist, point_ids, pose_ids, exclude_point_ids=["tip:thumb"]
+        )
+        self.assertEqual(result["point_ids"], ["tip:index", "tip:middle", "tip:ring"])
+        self.assertEqual(result["excluded_point_ids"], ["tip:thumb"])
+        self.assertEqual(result["no_model_point_ids"], ["tip:pinky"])
+        self.assertEqual(result["stage1"]["point_count"], 5)
+        with self.assertRaisesRegex(ValueError, "第二步至少需要"):
+            solve_hand_mount_two_stage(
+                by_point, p_wrist, point_ids, pose_ids,
+                exclude_point_ids=["tip:thumb", "tip:index"],
+            )
+
+    def test_leave_one_pose_out(self):
+        _, p_wrist, point_ids, pose_ids = _observations(3, noise_mm=1.0)
+        by_point = {pid: np.asarray(HAND_POINTS[pid]) for pid in HAND_POINTS}
+        report = leave_one_pose_out_two_stage(by_point, p_wrist, point_ids, pose_ids)
+        self.assertTrue(report["feasible"])
+        self.assertEqual(len(report["folds"]), 3)
+        self.assertLess(report["stats_mm"]["rms"], 8.0)
 
 
 if __name__ == "__main__":
