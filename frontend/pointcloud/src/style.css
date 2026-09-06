@@ -864,6 +864,17 @@ button:disabled {
   line-height: 1;
 }
 
+.mount-slot-clear.armed {
+  border-color: #ef5666;
+  background: #ef5666;
+  color: #fff;
+}
+
+.mount-slot small.pending-delete {
+  color: #f87171;
+  text-decoration: line-through;
+}
+
 .mount-slot-clear:hover {
   border-color: #ef5666;
   background: #7b202d;

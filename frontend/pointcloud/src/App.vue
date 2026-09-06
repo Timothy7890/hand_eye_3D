@@ -41,6 +41,8 @@ const mountDrafts = ref([])
 const mountSamples = ref([])
 const mountMinPoints = ref(3)
 const mountSavedCloudPoints = ref([])
+// 本 episode 已保存、被 × 标记为待删除的槽位；只改本地状态，点「保存」时才真正删文件
+const mountPendingDeleteIds = ref(new Set())
 const mountProfiles = ref([])
 const selectedMountProfileId = ref('')
 const loadedMountProfileId = ref('')
@@ -223,7 +225,7 @@ const canSave = computed(() =>
   && Boolean(selectedEpisode.value),
 )
 const canSaveMount = computed(() =>
-  mountCloudPickedIds.value.size > 0
+  (mountCloudPickedIds.value.size > 0 || mountPendingDeleteIds.value.size > 0)
   && !cloudBusy.value
   && !mountSaveBusy.value
   && Boolean(selectedEpisode.value)
@@ -507,6 +509,7 @@ function restoreSavedMountPoints(geometry) {
     return 0
   }
   mountSavedCloudPoints.value = mountSavedForEpisode.value
+    .filter((sample) => !mountPendingDeleteIds.value.has(sample.point_id))
     .filter((sample) => Array.isArray(sample.p_camera) && sample.p_camera.length === 3)
     .map((sample) => {
       const target = sample.p_camera.map(Number)
@@ -563,6 +566,7 @@ async function loadPointCloud() {
   selections.value = []
   keepOnlyMountModelPoints()
   mountSavedCloudPoints.value = []
+  mountPendingDeleteIds.value = new Set()
   lastMountSelectedPointId.value = ''
   cloudId.value = ''
   pointCount.value = 0
@@ -1373,7 +1377,19 @@ async function clearMountSlotCloudPoint(pointId) {
     return
   }
   const saved = mountSavedForEpisode.value.find((item) => item.point_id === pointId)
-  if (saved) await deleteMountSample(saved.index)
+  if (!saved) return
+  const next = new Set(mountPendingDeleteIds.value)
+  const label = mountSlotInfo(pointId).shortLabel
+  if (next.has(pointId)) {
+    next.delete(pointId)
+    infoMsg.value = `已取消删除 ${label}，文件未改动`
+  } else {
+    next.add(pointId)
+    infoMsg.value = `${label} 已标记为待删除；点「保存」才会真正删除，再按 × 可取消`
+  }
+  mountPendingDeleteIds.value = next
+  restoreSavedMountPoints(cloudObject?.geometry)
+  refreshHighlights()
 }
 
 function clearMountDrafts() {
@@ -1387,10 +1403,12 @@ function clearMountDrafts() {
 
 function clearMountCloudSelections() {
   keepOnlyMountModelPoints()
+  mountPendingDeleteIds.value = new Set()
   lastMountSelectedPointId.value = ''
+  restoreSavedMountPoints(cloudObject?.geometry)
   refreshHighlights()
   refreshHandPointMarkers()
-  infoMsg.value = '已撤销当前 episode 尚未保存的点云选择；模型点仍保留'
+  infoMsg.value = '已撤销当前 episode 尚未保存的点云修改（新选与待删除）；模型点仍保留'
 }
 
 async function loadHandsCatalog() {
@@ -1493,6 +1511,30 @@ async function saveMountSelections() {
   try {
     const paired = mountDrafts.value.filter((item) => item.vertexIndex != null)
     const savedEpisode = selectedEpisode.value
+    const pairedIdsEarly = new Set(paired.map((item) => item.point_id))
+
+    // 1) 先执行 × 标记的删除（没被新点覆盖的那些）
+    const toDelete = mountSavedForEpisode.value.filter(
+      (item) => mountPendingDeleteIds.value.has(item.point_id) && !pairedIdsEarly.has(item.point_id),
+    )
+    if (toDelete.length) {
+      mountSaveStatus.value = `正在删除 ${toDelete.length} 个实体点…`
+      await Promise.all(toDelete.map(async (item) => {
+        const response = await fetch(`/api/mount/samples/${item.index}`, { method: 'DELETE' })
+        if (!response.ok) throw await responseError(response, `删除 ${item.point_id} 失败`)
+      }))
+      mountPendingDeleteIds.value = new Set()
+    }
+    if (!paired.length) {
+      // 只有删除、没有新点
+      mountResult.value = null
+      overlayVisible.value = false
+      clearOverlay()
+      await refreshMountSamples()
+      refreshHighlights()
+      infoMsg.value = `已删除 ${toDelete.length} 个实体点，本会话共 ${mountSamples.value.length} 条`
+      return
+    }
     // 实体点单独保存：模型点没标就存 null；若是重选同槽实体点，沿用旧样本里的模型点
     const previousById = new Map(mountSavedForEpisode.value.map((item) => [item.point_id, item]))
     const modelFor = (item) => {
@@ -1595,9 +1637,10 @@ async function saveMountSelections() {
     chooseNextMountCloudSlot()
     refreshHighlights()
     const missingNow = confirmation.observations.filter((o) => !hasModelPoint(o)).length
+    const deletedNote = toDelete.length ? `，删除 ${toDelete.length} 个` : ''
     infoMsg.value = missingNow
       ? `已保存 ${saved.saved_count} 个实体点（其中 ${missingNow} 个还没有模型点，标好模型点后点「写入已保存样本」即可补齐），本会话共 ${saved.count} 条`
-      : `已保存 ${saved.saved_count} 个安装配对，本会话共 ${saved.count} 条`
+      : `已保存 ${saved.saved_count} 个实体点${deletedNote}，本会话共 ${saved.count} 条`
   } catch (error) {
     setError(error)
   } finally {
@@ -2314,7 +2357,8 @@ onBeforeUnmount(() => {
                   >
                     <i :style="{ background: slot.color }"></i>
                     <span>{{ slot.shortLabel }}</span>
-                    <small v-if="mountPairedIds.has(slot.point_id)">待保存</small>
+                    <small v-if="mountPendingDeleteIds.has(slot.point_id) && !mountCloudPickedIds.has(slot.point_id)" class="pending-delete">待删除</small>
+                    <small v-else-if="mountPairedIds.has(slot.point_id)">待保存</small>
                     <small v-else-if="mountCloudOnlyIds.has(slot.point_id)" class="missing-model">待保存·缺模型点</small>
                     <small v-else-if="mountSavedMissingModelIds.has(slot.point_id)" class="missing-model">已保存·缺模型点</small>
                     <small v-else-if="mountSavedIds.has(slot.point_id)">已保存</small>
@@ -2326,7 +2370,10 @@ onBeforeUnmount(() => {
                   <button
                     v-if="mountCloudPickedIds.has(slot.point_id) || mountSavedIds.has(slot.point_id)"
                     class="mount-slot-clear"
-                    :title="`删除 ${slot.shortLabel} 的实体点`"
+                    :class="{ armed: mountPendingDeleteIds.has(slot.point_id) }"
+                    :title="mountCloudPickedIds.has(slot.point_id)
+                      ? `撤销 ${slot.shortLabel} 的待保存实体点`
+                      : (mountPendingDeleteIds.has(slot.point_id) ? `取消删除 ${slot.shortLabel}` : `标记删除 ${slot.shortLabel} 的实体点（点保存后生效）`)"
                     @click.stop="clearMountSlotCloudPoint(slot.point_id)"
                   >
                     ×
@@ -2381,7 +2428,7 @@ onBeforeUnmount(() => {
               <div>
                 <h2>4. 当前 episode 实体点</h2>
                 <span>
-                  {{ mountCloudPickedIds.size }} 个待保存 · {{ mountSavedForEpisode.length }} 个已保存
+                  {{ mountCloudPickedIds.size }} 个待保存 · {{ mountSavedForEpisode.length }} 个已保存<template v-if="mountPendingDeleteIds.size"> · {{ mountPendingDeleteIds.size }} 个待删除</template>
                   <template v-if="mountSavedMissingModelIds.size"> · 已保存中 {{ mountSavedMissingModelIds.size }} 个缺模型点</template>
                 </span>
               </div>
@@ -2397,7 +2444,9 @@ onBeforeUnmount(() => {
               {{
                 mountSaveBusy
                   ? mountSaveStatus
-                  : `保存当前所选 ${mountCloudPickedIds.size} 个点云点`
+                  : (mountPendingDeleteIds.size
+                    ? `保存修改（新增/替换 ${mountCloudPickedIds.size} · 删除 ${mountPendingDeleteIds.size}）`
+                    : `保存当前所选 ${mountCloudPickedIds.size} 个点云点`)
               }}
             </button>
             <p class="mount-save-hint">
